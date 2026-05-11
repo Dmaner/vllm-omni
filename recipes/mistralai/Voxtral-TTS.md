@@ -104,4 +104,4 @@ mistralai/Voxtral-4B-TTS-2603 checkpoint. running the
 voice-cloning e2e test ([`Voice cloning (capability gated upstream)`](../../examples/offline_inference/text_to_speech/README.md#voice-cloning-capability-gated-upstream)
 ) or adding a `ref_audio` request parameter will fail
 because the public checkpoint does not provide the encoder weights needed to
-convert reference audio into conditioning features. . The expected failure is: `RuntimeError: encode_waveforms requires encoder weights which are not available in the open-source checkpoint.`
+convert reference audio into conditioning features. The expected failure is: `RuntimeError: encode_waveforms requires encoder weights which are not available in the open-source checkpoint.`
