@@ -33,8 +33,19 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=False,
         description=(
             "If true, stream raw PCM audio chunks as they are decoded. "
-            "Requires response_format='pcm'. Speed adjustment is not supported when streaming."
+            "Requires response_format='pcm' or 'wav'. Speed adjustment is not supported when streaming."
         ),
+    )
+    word_timestamps: bool = Field(
+        default=False,
+        description=(
+            "If true, include per-word timestamps in SSE speech streaming responses. "
+            "Requires stream=true, stream_format='sse', and response_format='pcm'."
+        ),
+    )
+    forced_aligner: str | None = Field(
+        default=None,
+        description="Optional forced aligner name registered by a vLLM-Omni plugin.",
     )
 
     # Qwen3-TTS specific parameters
@@ -89,8 +100,6 @@ class OpenAICreateSpeechRequest(BaseModel):
     @field_validator("stream_format")
     @classmethod
     def validate_stream_format(cls, v: str) -> str:
-        if v == "sse":
-            raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
         return v
 
     @field_validator("speaker_embedding")
@@ -98,6 +107,16 @@ class OpenAICreateSpeechRequest(BaseModel):
     def validate_speaker_embedding(cls, v: list[float] | None) -> list[float] | None:
         if v is not None and not all(math.isfinite(x) for x in v):
             raise ValueError("'speaker_embedding' values must be finite (no NaN or Inf)")
+        return v
+
+    @field_validator("forced_aligner")
+    @classmethod
+    def validate_forced_aligner(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            raise ValueError("'forced_aligner' must be non-empty when provided")
         return v
 
     @model_validator(mode="after")
@@ -109,6 +128,16 @@ class OpenAICreateSpeechRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "OpenAICreateSpeechRequest":
+        if self.stream_format == "sse":
+            if not self.stream:
+                raise ValueError("stream_format='sse' requires stream=true.")
+            if self.response_format != "pcm":
+                raise ValueError(
+                    "SSE speech streaming requires response_format='pcm'. "
+                    f"Got response_format='{self.response_format}'."
+                )
+        if self.word_timestamps and not (self.stream and self.stream_format == "sse"):
+            raise ValueError("word_timestamps=true requires stream=true and stream_format='sse'.")
         if self.stream:
             if self.response_format not in ("pcm", "wav"):
                 raise ValueError(
@@ -122,6 +151,12 @@ class OpenAICreateSpeechRequest(BaseModel):
                     "Speed adjustment is not supported when streaming (stream=true). Set speed=1.0 or omit it."
                 )
         return self
+
+
+class WordTimestamp(BaseModel):
+    word: str
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(ge=0)
 
 
 class OpenAICreateAudioGenerateRequest(BaseModel):

@@ -54,6 +54,7 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
     create_instruction as ming_create_instruction,
 )
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils.forced_aligner import align_words, get_forced_aligner
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
@@ -1512,14 +1513,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
         return wav_np.tolist(), sr
 
-    async def _generate_audio_chunks(
+    async def _iter_audio_chunk_arrays(
         self,
         generator,
         request_id: str,
-        response_format: str = "pcm",
         raw_request: Request | None = None,
     ):
-        """Generate audio chunks for streaming response.
+        """Yield decoded audio chunks as numpy arrays plus sample-rate metadata.
 
         Handles two audio output modes from the engine:
         - Cumulative mode (list): Engine returns growing list of chunks;
@@ -1530,14 +1530,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Args:
             generator: Async generator from the engine
             request_id: Request identifier for logging
-            response_format: Audio format (pcm or wav)
 
         Yields:
-            Raw audio bytes for each chunk (with WAV header for first chunk if wav format)
+            Tuples of ``(chunk_np, sample_rate, sr_raw)``.
         """
         prev_count = 0
         sample_rate_val = 24000
-        first_chunk = True
 
         try:
             async for res in generator:
@@ -1569,27 +1567,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
                     if chunk_np.ndim > 1:
                         chunk_np = chunk_np.squeeze()
-                    # For WAV format, emit header before first audio chunk
-                    if response_format == "wav" and first_chunk:
-                        # Assert that sample rate has been set from chunk metadata (not just default)
-                        # This ensures the WAV header contains the correct sample rate
-                        assert sr_raw is not None, (
-                            "First audio chunk must include sample rate metadata for WAV streaming"
-                        )
-                        wav_header = _create_wav_header(sample_rate=sample_rate_val, num_channels=1, bits_per_sample=16)
-                        yield wav_header
-                        first_chunk = False
-
-                    # Convert audio to PCM bytes
-                    audio_obj = CreateAudio(
-                        audio_tensor=chunk_np,
-                        sample_rate=sample_rate_val,
-                        response_format="pcm",
-                        speed=1.0,
-                        stream_format="audio",
-                        base64_encode=False,
-                    )
-                    yield self.create_audio(audio_obj).audio_data
+                    yield chunk_np, sample_rate_val, sr_raw
         except asyncio.CancelledError:
             logger.info("Streaming request %s cancelled by client", request_id)
             raise
@@ -1609,6 +1587,99 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         except Exception as e:
             logger.exception("Streaming speech generation failed for %s: %s", request_id, e)
             raise
+
+    async def _generate_audio_chunks(
+        self,
+        generator,
+        request_id: str,
+        response_format: str = "pcm",
+        raw_request: Request | None = None,
+    ):
+        """Generate audio chunks for streaming response.
+
+        Yields raw audio bytes for each chunk, with a WAV header before the
+        first audio chunk when ``response_format`` is ``"wav"``.
+        """
+        first_chunk = True
+
+        async for chunk_np, sample_rate_val, sr_raw in self._iter_audio_chunk_arrays(
+            generator,
+            request_id,
+            raw_request=raw_request,
+        ):
+            # For WAV format, emit header before first audio chunk
+            if response_format == "wav" and first_chunk:
+                # Assert that sample rate has been set from chunk metadata (not just default)
+                # This ensures the WAV header contains the correct sample rate
+                assert sr_raw is not None, "First audio chunk must include sample rate metadata for WAV streaming"
+                wav_header = _create_wav_header(sample_rate=sample_rate_val, num_channels=1, bits_per_sample=16)
+                yield wav_header
+                first_chunk = False
+
+            # Convert audio to PCM bytes
+            audio_obj = CreateAudio(
+                audio_tensor=chunk_np,
+                sample_rate=sample_rate_val,
+                response_format="pcm",
+                speed=1.0,
+                stream_format="audio",
+                base64_encode=False,
+            )
+            yield self.create_audio(audio_obj).audio_data
+
+    async def _generate_audio_sse_events(
+        self,
+        generator,
+        request: OpenAICreateSpeechRequest,
+        request_id: str,
+        raw_request: Request | None = None,
+    ):
+        """Generate SSE events with base64 PCM audio and optional word timestamps."""
+        audio_offset_ms = 0
+
+        async for chunk_np, sample_rate_val, _ in self._iter_audio_chunk_arrays(
+            generator,
+            request_id,
+            raw_request=raw_request,
+        ):
+            audio_obj = CreateAudio(
+                audio_tensor=chunk_np,
+                sample_rate=sample_rate_val,
+                response_format="pcm",
+                speed=1.0,
+                stream_format="audio",
+                base64_encode=False,
+            )
+            pcm_data = self.create_audio(audio_obj).audio_data
+            if isinstance(pcm_data, str):
+                pcm_bytes = pcm_data.encode("utf-8")
+            else:
+                pcm_bytes = pcm_data
+
+            word_timestamps: list[dict[str, Any]] = []
+            if request.word_timestamps:
+                word_timestamps = align_words(
+                    audio=chunk_np,
+                    text=request.input,
+                    sample_rate=sample_rate_val,
+                    audio_offset_ms=audio_offset_ms,
+                    aligner_name=request.forced_aligner,
+                )
+
+            payload = {
+                "type": "audio.delta",
+                "audio": base64.b64encode(pcm_bytes).decode("ascii"),
+                "format": "pcm",
+                "sample_rate": sample_rate_val,
+                "word_timestamps": word_timestamps,
+            }
+            yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+            chunk_samples = int(chunk_np.shape[-1]) if getattr(chunk_np, "shape", None) else 0
+            if sample_rate_val > 0:
+                audio_offset_ms += int(round(chunk_samples * 1000 / sample_rate_val))
+
+        yield 'data: {"type":"audio.done"}\n\n'
 
     @staticmethod
     def _extract_audio_output(res) -> tuple[dict | None, str | None]:
@@ -2524,6 +2595,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if request.stream:
                 # Determine response format and media type for streaming
                 response_format = (request.response_format or "wav").lower()
+                stream_format = request.stream_format or "audio"
 
                 # Only pcm and wav support streaming without post-processing
                 if response_format not in ["pcm", "wav"]:
@@ -2537,6 +2609,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     return self.create_error_response(
                         "Streaming is not supported with speed adjustment. "
                         "Use stream=False or remove the speed parameter."
+                    )
+
+                if stream_format == "sse":
+                    if response_format != "pcm":
+                        return self.create_error_response("SSE speech streaming requires response_format='pcm'.")
+                    if request.word_timestamps and request.forced_aligner:
+                        get_forced_aligner(request.forced_aligner)
+                    _, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
+                    return StreamingResponse(
+                        self._generate_audio_sse_events(
+                            generator,
+                            request,
+                            request_id,
+                            raw_request=raw_request,
+                        ),
+                        media_type="text/event-stream",
                     )
 
                 media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
