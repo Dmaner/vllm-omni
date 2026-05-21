@@ -10,12 +10,21 @@ from vllm.model_executor.layers.rotary_embedding import (
 from vllm.v1.engine import EngineCoreOutput as _OriginalEngineCoreOutput
 from vllm.v1.engine import EngineCoreOutputs as _OriginalEngineCoreOutputs
 from vllm.v1.engine import EngineCoreRequest as _OriginalEngineCoreRequest
+from vllm.v1.engine.output_processor import RequestState as _OriginalOutputRequestState
 from vllm.v1.request import Request as _OriginalRequest
 from vllm.v1.request import RequestStatus
 from vllm.v1.request import StreamingUpdate as _OriginalStreamingUpdate
+from vllm.v1.serial_utils import MsgpackDecoder
 
 import vllm_omni.logger  # noqa: F401
-from vllm_omni.engine import OmniEngineCoreOutput, OmniEngineCoreOutputs, OmniEngineCoreRequest
+from vllm_omni.engine import (
+    OmniEngineCoreOutput,
+    OmniEngineCoreOutputs,
+    OmniEngineCoreRequest,
+    OmniPoolingOutput,
+    decode_omni_pooling_output,
+    unwrap_omni_pooling_output,
+)
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.rotary_embedding import OmniMRotaryEmbedding
 from vllm_omni.request import OmniRequest, OmniStreamingUpdate
@@ -69,6 +78,38 @@ assert _installed is _patched_cp, (
     "is_mm_prefix_lm patch failed to install — bidirectional attention "
     "for HunyuanImage3 will not work. Check vLLM ModelConfig changes."
 )
+
+_original_msgpack_dec_hook = MsgpackDecoder.dec_hook
+
+
+def _patched_msgpack_dec_hook(self, t, obj):
+    if t is OmniPoolingOutput:
+        return decode_omni_pooling_output(self, obj)
+    return _original_msgpack_dec_hook(self, t, obj)
+
+
+MsgpackDecoder.dec_hook = _patched_msgpack_dec_hook
+
+_original_make_request_output = _OriginalOutputRequestState.make_request_output
+
+
+def _patched_make_request_output(
+    self,
+    new_token_ids,
+    pooling_output,
+    *args,
+    **kwargs,
+):
+    return _original_make_request_output(
+        self,
+        new_token_ids,
+        unwrap_omni_pooling_output(pooling_output),
+        *args,
+        **kwargs,
+    )
+
+
+_OriginalOutputRequestState.make_request_output = _patched_make_request_output
 
 # =============================================================================
 # Patch GlmImageTextConfig to expose mrope_section in rope_parameters

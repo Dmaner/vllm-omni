@@ -116,8 +116,40 @@ class OmniEngineCoreRequest(EngineCoreRequest):
         )
 
 
+class OmniPoolingOutput:
+    """Msgpack marker for pooling outputs that may be tensor or omni payload."""
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.value, name)
+
+
+def _is_serialized_tensor(value: Any) -> bool:
+    return isinstance(value, list) and len(value) == 3 and isinstance(value[0], str) and isinstance(value[1], list)
+
+
+def _decode_pooling_value(decoder: Any, value: Any) -> Any:
+    if _is_serialized_tensor(value):
+        return decoder._decode_tensor(value)
+    if isinstance(value, dict):
+        return {key: _decode_pooling_value(decoder, val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [_decode_pooling_value(decoder, val) for val in value]
+    return value
+
+
+def decode_omni_pooling_output(decoder: Any, value: Any) -> OmniPoolingOutput:
+    return OmniPoolingOutput(_decode_pooling_value(decoder, value))
+
+
+def unwrap_omni_pooling_output(value: Any) -> Any:
+    return value.value if isinstance(value, OmniPoolingOutput) else value
+
+
 class OmniEngineCoreOutput(EngineCoreOutput):
-    pooling_output: dict[str, torch.Tensor] | None = None
+    pooling_output: OmniPoolingOutput | None = None
     # Finished flag for streaming input segment
     is_segment_finished: bool | None = False
     # Streaming update prompt length

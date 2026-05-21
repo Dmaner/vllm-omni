@@ -20,6 +20,7 @@ from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.data_entry_keys import unflatten_payload
+from vllm_omni.engine import unwrap_omni_pooling_output
 from vllm_omni.engine.output_modality import DRAINABLE_MODALITIES
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -191,6 +192,8 @@ class OmniRequestState(RequestState):
             OmniRequestOutput or PoolingRequestOutput if output should be
             emitted (based on finish status and output kind), None otherwise
         """
+        pooling_output = unwrap_omni_pooling_output(pooling_output)
+
         # Pooling-only requests should follow base behavior.
         if self.detokenizer is None and pooling_output is not None:
             return super().make_request_output(
@@ -406,7 +409,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             req_state = self.request_states.get(eco.request_id)
             if req_state is None or not isinstance(req_state, OmniRequestState):
                 continue
-            if eco.pooling_output is not None and req_state.detokenizer is not None:
+            eco.pooling_output = unwrap_omni_pooling_output(eco.pooling_output)
+            if isinstance(eco.pooling_output, dict) and req_state.detokenizer is not None:
                 mm_type = (getattr(eco, "output_type", self.engine_core_output_type) or "").lower()
                 req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
                 # Force text path in base processor for multimodal outputs.

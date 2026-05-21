@@ -171,6 +171,12 @@ class OpenAICreateAudioGenerateRequest(BaseModel):
         return v
 
 
+class WordTimestamp(BaseModel):
+    word: str
+    start_ms: int
+    end_ms: int
+
+
 class CreateAudio(BaseModel):
     audio_tensor: np.ndarray
     sample_rate: int = 24000
@@ -280,6 +286,18 @@ class StreamingSpeechSessionConfig(BaseModel):
         description=(
             "Text splitting granularity: 'sentence' splits on .!?。！？, "
             "'clause' also splits on CJK commas ， and semicolons ；."
+        ),
+    )
+    word_timestamps: bool = Field(
+        default=True,
+        description="Emit word/character timestamps aligned to generated speech.",
+    )
+
+    word_timestamp_mode: Literal["final", "delta"] = Field(
+        default="final",
+        description=(
+            "'final' emits timestamps after each sentence audio is generated; "
+            "'delta' may periodically emit stable timestamp deltas while streaming."
         ),
     )
 
