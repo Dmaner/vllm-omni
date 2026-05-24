@@ -54,6 +54,8 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
     create_instruction as ming_create_instruction,
 )
 from vllm_omni.outputs import OmniRequestOutput
+from vllm_omni.utils.forced_aligner import ForcedAlignerConfig
+from vllm_omni.utils.forced_aligner import align as forced_align
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 logger = init_logger(__name__)
@@ -316,6 +318,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def __init__(self, *args, **kwargs):
         self.model_name = kwargs.pop("model_name", None)
+        self._forced_aligner_config = kwargs.pop("forced_aligner_config", ForcedAlignerConfig.disabled())
         super().__init__(*args, **kwargs)
         self._init_speaker_storage()
 
@@ -401,6 +404,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         elapsed = time.time() - t0
         logger.info("Speech warmup complete in %.1fs", elapsed)
+
+    async def align_word_timestamps(
+        self,
+        audio_chunk: bytes,
+        text: str,
+        sample_rate: int,
+    ) -> list:
+        return await forced_align(
+            audio_chunk=audio_chunk,
+            text=text,
+            sr=sample_rate,
+            config=self._forced_aligner_config,
+        )
 
     def _get_qwen_tts_expected_speaker_embedding_dim(self) -> int | None:
         """Return the loaded Qwen3-TTS speaker embedding dim, if known.

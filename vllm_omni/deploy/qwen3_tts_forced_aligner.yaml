@@ -1,0 +1,17 @@
+# Generic deployment profile for Qwen/Qwen3-ForcedAligner-0.6B in TTS timestamping.
+#
+# vLLM runs this model as:
+#   runner="pooling"
+#   hf_overrides={"architectures": ["Qwen3ASRForcedAlignerForTokenClassification"]}
+# and requests use pooling_task="token_classify".
+# Those model-specific pieces are fixed in the Qwen forced-aligner adapter;
+# this file only carries runtime/resource knobs.
+
+forced_aligner:
+  dtype: bfloat16
+  gpu_memory_utilization: 0.25
+  max_model_len: 512
+  max_num_batched_tokens: 512
+  max_num_seqs: 1
+  startup_timeout: 300
+  request_timeout: 300

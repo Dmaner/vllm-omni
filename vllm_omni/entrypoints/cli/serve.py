@@ -638,6 +638,16 @@ class OmniServeCommand(CLISubcommand):
             default=None,
             help="Maximum length for TTS voice style instructions (overrides stage config, default: 500).",
         )
+        omni_config_group.add_argument(
+            "--forced-aligner",
+            type=str,
+            default=None,
+            help=(
+                "Enable a forced aligner for streaming TTS timestamps with "
+                "the given model path/name, such as Qwen/Qwen3-ForcedAligner-0.6B. "
+                "Disabled when omitted."
+            ),
+        )
 
         # Enable diffusion pipeline profiling
         omni_config_group.add_argument(

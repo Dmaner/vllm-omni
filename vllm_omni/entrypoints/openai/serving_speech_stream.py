@@ -38,7 +38,6 @@ from vllm_omni.entrypoints.openai.text_splitter import (
     SPLIT_SENTENCE,
     SentenceSplitter,
 )
-from vllm_omni.utils.forced_aligner import align as forced_align
 
 logger = init_logger(__name__)
 
@@ -324,7 +323,7 @@ class OmniStreamingSpeechHandler:
                 async with aclosing(self._speech_service._generate_pcm_chunks(generator, request_id)) as stream:
                     async for chunk in stream:
                         total_bytes += len(chunk)
-                        if config.word_timestamps:
+                        if config.word_timestamps is True:
                             pcm_buffer.extend(chunk)
                         await websocket.send_bytes(chunk)
             else:
@@ -332,7 +331,7 @@ class OmniStreamingSpeechHandler:
                 total_bytes = len(audio_bytes)
                 await websocket.send_bytes(audio_bytes)
 
-            if config.word_timestamps and config.stream_audio and not generation_failed:
+            if config.word_timestamps is True and config.stream_audio and not generation_failed:
                 audio_chunk = bytes(pcm_buffer)
 
                 await self._align_and_send_word_timestamps(
@@ -389,15 +388,15 @@ class OmniStreamingSpeechHandler:
         sample_rate: int,
     ) -> None:
         try:
-            word_timestamps = await forced_align(
+            word_timestamps = await self._speech_service.align_word_timestamps(
                 audio_chunk=audio_chunk,
                 text=sentence_text,
-                sr=sample_rate,
+                sample_rate=sample_rate,
             )
 
             await websocket.send_json(
                 {
-                    "type": "word_timestamps",
+                    "type": "audio.word_timestamps",
                     "sentence_index": sentence_index,
                     "word_timestamps": [asdict(item) for item in word_timestamps],
                 }
@@ -412,7 +411,7 @@ class OmniStreamingSpeechHandler:
             )
             await websocket.send_json(
                 {
-                    "type": "word_timestamps",
+                    "type": "audio.word_timestamps",
                     "sentence_index": sentence_index,
                     "word_timestamps": [],
                     "error": str(e),

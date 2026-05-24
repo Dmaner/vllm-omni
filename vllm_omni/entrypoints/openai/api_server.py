@@ -131,6 +131,7 @@ from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
 from vllm_omni.entrypoints.openai.video_api_utils import decode_input_reference
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
+from vllm_omni.utils.forced_aligner import build_forced_aligner_config
 
 logger = init_logger(__name__)
 router = APIRouter()
@@ -913,7 +914,11 @@ async def omni_init_app_state(
     )
 
     state.openai_serving_speech = OmniOpenAIServingSpeech(
-        engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
+        engine_client,
+        state.openai_serving_models,
+        request_logger=request_logger,
+        model_name=model_name,
+        forced_aligner_config=build_forced_aligner_config(args),
     )
 
     # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first

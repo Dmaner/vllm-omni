@@ -289,8 +289,8 @@ class StreamingSpeechSessionConfig(BaseModel):
         ),
     )
     word_timestamps: bool = Field(
-        default=True,
-        description="Emit word/character timestamps aligned to generated speech.",
+        default=False,
+        description="Emit word/character timestamps aligned to generated speech when the server enables an aligner.",
     )
 
     word_timestamp_mode: Literal["final", "delta"] = Field(
