@@ -5,9 +5,11 @@ tasks, then runs Omni generation and saves output wav files.
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
+from dataclasses import asdict
 from typing import Any, NamedTuple
 
 import soundfile as sf
@@ -378,7 +380,62 @@ def _save_wav(output_dir: str, request_id: str, mm: dict) -> None:
     logger.info(f"Request ID: {request_id}, Saved audio to {out_wav}")
 
 
-def main(args):
+def _extract_audio_for_timestamps(mm: dict) -> tuple[torch.Tensor, int]:
+    audio_data = mm["audio"]
+    sr_raw = mm["sr"]
+    sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+    sr = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+    audio_tensor = torch.cat(audio_data, dim=-1) if isinstance(audio_data, list) else audio_data
+    return audio_tensor.float().cpu().flatten(), sr
+
+
+def _get_text_from_prompt(prompt: dict) -> str:
+    additional_information = prompt.get("additional_information", {})
+    text = additional_information.get("text", "")
+    if isinstance(text, list):
+        return str(text[0]) if text else ""
+    return str(text)
+
+
+def _audio_tensor_to_pcm16_bytes(audio_tensor: torch.Tensor) -> bytes:
+    pcm = audio_tensor.float().cpu().flatten().clamp(-1.0, 1.0)
+    return (pcm * 32767.0).to(torch.int16).numpy().tobytes()
+
+
+async def _save_word_timestamps(output_dir: str, request_id: str, mm: dict, prompt: dict, args) -> None:
+    if not args.forced_aligner:
+        return
+
+    from vllm_omni.utils.forced_aligner import align as forced_align
+    from vllm_omni.utils.forced_aligner import build_forced_aligner_config
+
+    audio_tensor, sample_rate = _extract_audio_for_timestamps(mm)
+    text = _get_text_from_prompt(prompt)
+    config = build_forced_aligner_config(args)
+    word_timestamps = await forced_align(
+        audio_chunk=_audio_tensor_to_pcm16_bytes(audio_tensor),
+        text=text,
+        sr=sample_rate,
+        config=config,
+    )
+
+    out_json = os.path.join(output_dir, f"output_{request_id}.timestamps.json")
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "request_id": request_id,
+                "text": text,
+                "sample_rate": sample_rate,
+                "word_timestamps": [asdict(item) for item in word_timestamps],
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    logger.info(f"Request ID: {request_id}, Saved word timestamps to {out_json}")
+
+
+async def main(args):
     """Run offline inference with Omni."""
     model_name, inputs = _build_inputs(args)
     output_dir = args.output_dir
@@ -387,14 +444,20 @@ def main(args):
     omni_kwargs = vars(args).copy()
     # Override CLI --model with the derived model_name.
     omni_kwargs["model"] = model_name
+    omni_kwargs.pop("forced_aligner", None)
     omni = Omni(**omni_kwargs)
 
     batch_size = args.batch_size
     for batch_start in range(0, len(inputs), batch_size):
         batch = inputs[batch_start : batch_start + batch_size]
+        batch_prompts = iter(batch)
         for stage_outputs in omni.generate(batch):
             output = stage_outputs.request_output
-            _save_wav(output_dir, output.request_id, output.outputs[0].multimodal_output)
+            prompt = next(batch_prompts)
+            mm = output.outputs[0].multimodal_output
+            _save_wav(output_dir, output.request_id, mm)
+            if args.forced_aligner:
+                await _save_word_timestamps(output_dir, output.request_id, mm, prompt, args)
 
 
 async def main_streaming(args):
@@ -406,6 +469,7 @@ async def main_streaming(args):
     omni_kwargs = vars(args).copy()
     # Override CLI --model with the derived model_name.
     omni_kwargs["model"] = model_name
+    omni_kwargs.pop("forced_aligner", None)
     omni = AsyncOmni(**omni_kwargs)
 
     for i, prompt in enumerate(inputs):
@@ -432,6 +496,8 @@ async def main_streaming(args):
                 total_ms = (t_end - t_start) * 1000
                 logger.info(f"Request {request_id}: done total={total_ms:.1f}ms chunks={chunk_idx}")
                 _save_wav(output_dir, request_id, mm)
+                if args.forced_aligner:
+                    await _save_word_timestamps(output_dir, request_id, mm, prompt, args)
 
 
 def parse_args():
@@ -547,6 +613,15 @@ def parse_args():
         default=1,
         help="Number of prompts per batch (default: 1, sequential).",
     )
+    parser.add_argument(
+        "--forced-aligner",
+        type=str,
+        default=None,
+        help=(
+            "Optional forced-aligner model path/name. When set, the demo also "
+            "saves output_<request_id>.timestamps.json."
+        ),
+    )
 
     nullify_stage_engine_defaults(parser)
     return parser.parse_args()
@@ -557,4 +632,4 @@ if __name__ == "__main__":
     if args.streaming:
         asyncio.run(main_streaming(args))
     else:
-        main(args)
+        asyncio.run(main(args))
