@@ -132,18 +132,19 @@ with `guidance_scale=1.0` remain valid on the same server: every rank evaluates
 only the positive branch, no negative embeddings are built, and no guidance is
 applied.
 
-### 1 x RTX 4090 48 GB (FP8)
+### 1 x RTX 4090 24 GB / 48 GB (FP8)
 
 Boogu-Image supports the following FP8 loading paths:
 
 | Path | Checkpoints | MLLM | DiT |
 | --- | --- | --- | --- |
 | Pre-quantized FP8 | `Boogu/Boogu-Image-0.1-{Base,Edit}-fp8` | HF checkpoint FP8 configuration | TorchAO FP8 weight-only (W8A16) |
-| Online FP8 | `Boogu/Boogu-Image-0.1-{Base,Edit}` | Optional native block FP8 (W8A8) | Native dynamic FP8 (W8A8) |
+| Online FP8 | `Boogu/Boogu-Image-0.1-{Base,Edit}` | Optional 128x128 block FP8: Triton W8A8 (vLLM 0.28.0); Marlin W8A16 (vLLM 0.29.0) | Native dynamic FP8 (CUTLASS W8A8) |
 
 #### Environment
 
-The following configuration was used for the FP8 measurements below:
+The following isolated environments were used for Base T2I and Edit I2I
+measurements at 512x512:
 
 - OS: Linux
 - Python: 3.12
@@ -208,14 +209,14 @@ quantization configuration.
       512x512 and 23.6-24.5 GiB at 1024x1024.
 
 - **Quantization scope:** For original Base/Edit checkpoints, `--quantization fp8`
-  quantizes the MLLM's language-model linear layers through HF block FP8
+  quantizes the MLLM's language-model linear layers through per-block FP8
   and the DiT's linear layers through native online FP8. The vision encoder,
   embeddings, normalization layers and VAE remain unquantized.
 
 - **Known Limitation:**
     - **Import compatibility conflict between TorchAO and Diffusers::** Loading pre-quantized checkpoints requires `torchao>=0.17.0`, which has a compatibility conflict with `diffusers==0.40.0`. This produces a warning when Diffusers is imported, but currently does not affect Boogu-Image weight loading.
 
-    - **Conflict between the default kernels and Transformers versions:** The default Transformers version range (`>=5.10.1,<5.15`) causes a version conflict with `kernels==0.16.1` when the MLLM part uses Transformers to load pre-quantized weights. So when using the default `kernels==0.16.1`, please upgrade Transformers to `5.17.0`.
+    - **Conflict between the default kernels and Transformers versions:** The default Transformers version range (`>=5.10.1,<5.15`) conflicts with `kernels==0.16.1` when loading pre-quantized FP8 MLLM weights through Hugging Face `FP8Linear`. When using this loading path with `kernels==0.16.1`, please upgrade Transformers to `5.17.0`.
 
 #### Verification
 
