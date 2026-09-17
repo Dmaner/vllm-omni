@@ -173,11 +173,6 @@ def init_parameters_preserving_vllm_linear(
     dtype: torch.dtype | None,
     device: torch.device | None = None,
 ) -> None:
-    """Allocate meta parameters while skipping vLLM LinearBase modules.
-
-    Preserve native Linear parameter subclasses and weight loaders, including
-    the callbacks that materialize and quantize FP8 layers as weights arrive.
-    """
     if isinstance(module, LinearBase):
         return
     for name, param in module.named_parameters(recurse=False):
@@ -217,7 +212,7 @@ def create_transformers_model_with_vllm_linears(
     prefix: str = "",
     skip_modules: Sequence[str] = (),
 ) -> PreTrainedModel:
-    """Build a Transformers model with vLLM linears for separate weight loading."""
+    """Build a Transformers model with vLLM linears."""
     with init_on_device_without_buffers("meta"):
         model = auto_cls.from_config(hf_config, dtype=dtype)
     recursive_replace_linear_with_quantization_config(model, quant_config, prefix=prefix, skip_modules=skip_modules)

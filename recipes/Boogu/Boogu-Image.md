@@ -213,6 +213,12 @@ quantization configuration.
   and the DiT's linear layers through native online FP8. The vision encoder,
   embeddings, normalization layers and VAE remain unquantized.
 
+- **Performance:** In the 48 GB Base/Edit benchmarks at 512x512, both DiT-only
+  and MLLM + DiT online FP8 reduced E2E latency by over 10 seconds compared with
+  official FP8 and vLLM-Omni pre-quantized FP8. The main runtime difference lies in the DiT quantization implementation, which switches from TorchAO weight-only FP8 (W8A16) to native CUTLASS
+  W8A8 kernels. This reduces additional dequantization overhead and enables
+  FP8 Tensor Core acceleration.
+
 - **Known Limitation:**
     - **Import compatibility conflict between TorchAO and Diffusers::** Loading pre-quantized checkpoints requires `torchao>=0.17.0`, which has a compatibility conflict with `diffusers==0.40.0`. This produces a warning when Diffusers is imported, but currently does not affect Boogu-Image weight loading.
 
