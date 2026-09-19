@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """SenseNova FP16/BF16 vs online-FP8 output-quality evaluation.
 
-Opt in with SENSENOVA_RUN_FP8_EVAL=1. See sensenova_u1_evaluation.md.
+Opt in with SENSENOVA_RUN_FP8_EVAL=1.
 Quality thresholds must be supplied explicitly; none are imposed by default.
 """
 
