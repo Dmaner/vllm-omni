@@ -1048,7 +1048,7 @@ class SenseNovaU1Pipeline(
                 min_pixels=512 * 512,
                 max_pixels=max_pixels_per_image,
             )
-            pixel_values_list.append(pv.to(self.device, dtype=self.od_config.dtype))
+            pixel_values_list.append(pv.to(self.device, dtype=torch.bfloat16))
             grid_hw_list.append(ghw.to(self.device))
         return torch.cat(pixel_values_list), torch.cat(grid_hw_list)
 
