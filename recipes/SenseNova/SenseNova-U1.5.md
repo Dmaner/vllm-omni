@@ -90,6 +90,15 @@ python examples/online_serving/sensenova_u1/openai_chat_client.py \
 
 `-s` takes the base URL; the client appends `/v1` itself.
 
+##### Online FP8 quantization
+
+For online serving, add `--quantization fp8` option:
+
+```bash
+vllm serve sensenova/SenseNova-U1.5-8B-MoT --omni \
+    --quantization fp8 --port 8091
+```
+
 #### Measured latency (1x A800 80GB, 25 steps, median of 3 after a warmup)
 
 | Resolution | Step latency | Total |
