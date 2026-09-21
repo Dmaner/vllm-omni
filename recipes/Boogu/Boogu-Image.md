@@ -220,6 +220,8 @@ quantization configuration.
   FP8 Tensor Core acceleration.
 
 - **Known Limitation:**
+    - **Output consistency:** With MLLM + DiT online FP8, same-seed outputs may visibly differ from BF16 for some Base prompts, but these differences do not mean lower image quality.
+
     - **Import compatibility conflict between TorchAO and Diffusers::** Loading pre-quantized checkpoints requires `torchao>=0.17.0`, which has a compatibility conflict with `diffusers==0.40.0`. This produces a warning when Diffusers is imported, but currently does not affect Boogu-Image weight loading.
 
     - **Conflict between the default kernels and Transformers versions:** The default Transformers version range (`>=5.10.1,<5.15`) conflicts with `kernels==0.16.1` when loading pre-quantized FP8 MLLM weights through Hugging Face `FP8Linear`. When using this loading path with `kernels==0.16.1`, please upgrade Transformers to `5.17.0`.
