@@ -92,9 +92,11 @@ python examples/online_serving/sensenova_u1/openai_chat_client.py \
 
 ##### Online FP8 quantization
 
-For online serving, add `--quantization fp8` option:
+For online serving on the tested A800/vLLM 0.29.0 setup, add
+`--quantization fp8` and disable the CUTLASS FP8 kernel to use Marlin W8A16:
 
 ```bash
+VLLM_DISABLED_KERNELS=CutlassFP8ScaledMMLinearKernel \
 vllm serve sensenova/SenseNova-U1.5-8B-MoT --omni \
     --quantization fp8 --port 8091
 ```
