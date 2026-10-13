@@ -1769,7 +1769,11 @@ def test_turbo_dmd_ti2i_keeps_reference_latents_and_uses_zero_conditioning_sigma
     ("version", "pipeline_name", "should_bind"),
     [
         ("0.30.0", "BooguImagePipeline", False),
+        ("0.30.0.dev1", "BooguImagePipeline", False),
+        ("0.31.0rc1", "BooguImagePipeline", True),
+        ("0.31.0.dev1", "BooguImagePipeline", True),
         ("0.31.0", "BooguImagePipeline", True),
+        ("0.31.0+cu132", "BooguImagePipeline", True),
         ("0.32.0", "BooguImagePipeline", True),
         ("0.31.0", "BooguImageTurboPipeline", True),
     ],

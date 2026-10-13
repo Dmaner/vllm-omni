@@ -252,8 +252,8 @@ directory and omit `--revision`.
 
     - **Conflict between the default kernels and Transformers versions:** The default Transformers version range (`>=5.10.1,<5.15`) conflicts with `kernels==0.16.1` when loading pre-quantized FP8 MLLM weights through Hugging Face `FP8Linear`. When using this loading path with `kernels==0.16.1`, please upgrade Transformers to `5.17.0`.
 
-    - **Online FP8 with vLLM 0.31 and later:** Check the selected MLLM kernel
-      on Ada (SM89) and Ampere (SM80 / SM86), where
+    - **Online FP8 with vLLM 0.31 and later:** This MLLM workaround was validated
+      on RTX 4090 (SM89), where
       online per-block FP8 can use Marlin. The shared Marlin workspace path can switch CUDA streams.
       Boogu's UNI output handoff lacks the
       corresponding cross-stream wait, which can corrupt generated images.

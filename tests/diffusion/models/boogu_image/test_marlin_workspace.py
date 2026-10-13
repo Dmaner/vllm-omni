@@ -9,6 +9,7 @@ import pytest
 import torch
 from torch import nn
 from vllm.model_executor.layers.quantization.online import fp8 as online_fp8
+from vllm.model_executor.layers.quantization.utils import marlin_utils
 
 from vllm_omni.diffusion.models.boogu_image import marlin_workspace as workspace
 
@@ -129,3 +130,39 @@ def test_apply_forwards_explicit_workspace_scales_shapes_dtype_and_bias(cpu_kern
         input_dtype=torch.bfloat16,
         bias=bias,
     )
+
+
+def test_apply_skips_shared_workspace_lookup_on_repeated_calls(cpu_kernel, monkeypatch, mocker):
+    layer = make_online_marlin_layer()
+    # Packed FP8 shape for padded (N, K) = (4, 16); logical shape is (3, 4).
+    layer.weight = nn.Parameter(torch.zeros(1, 16, dtype=torch.int32), requires_grad=False)
+    layer.weight_scale = torch.ones(1, 4)
+    workspace.bind_boogu_marlin_workspaces(nn.ModuleList([layer]))
+    buffer = torch.zeros(16, dtype=torch.int32)
+    layer.register_buffer(workspace._WORKSPACE_NAME, buffer, persistent=False)
+    x = torch.ones(2, 4, dtype=torch.bfloat16)
+    output = torch.ones(2, 4, dtype=torch.bfloat16)
+
+    # Keep both Python helpers real, bypassing only CUDA dispatch and execution.
+    monkeypatch.setattr(torch.ops.vllm, "marlin_gemm", marlin_utils._marlin_gemm)
+    gemm = mocker.patch.object(torch.ops._C, "marlin_gemm", return_value=output, create=True)
+    shared_workspace = mocker.patch.object(
+        marlin_utils, "get_marlin_workspace", side_effect=AssertionError("shared workspace lookup")
+    )
+
+    # Control: the old workspace=None path must reach the lookup that can switch streams.
+    with pytest.raises(AssertionError, match="shared workspace lookup"):
+        workspace.apply_fp8_marlin_linear(
+            input=x, weight=layer.weight, weight_scale=layer.weight_scale, workspace=None, size_n=3, size_k=4, bias=None
+        )
+    shared_workspace.assert_called_once_with(x.device)
+    gemm.assert_not_called()
+    shared_workspace.reset_mock()
+
+    for _ in range(2):
+        result = layer.quant_method.fp8_linear.apply_weights(layer, x)
+        torch.testing.assert_close(result, output[:, :3])
+
+    shared_workspace.assert_not_called()
+    assert gemm.call_count == 2
+    assert all(call.args[8] is buffer for call in gemm.call_args_list)

@@ -366,7 +366,7 @@ class BooguImagePipeline(CFGParallelMixin, nn.Module, ProgressBarMixin, Supports
             skip_modules=("mllm.visual",),
         )
 
-        if Version(vllm.__version__) >= Version("0.31.0"):
+        if Version(vllm.__version__).release >= (0, 31, 0):
             from vllm_omni.diffusion.models.boogu_image.marlin_workspace import bind_boogu_marlin_workspaces
 
             bind_boogu_marlin_workspaces(mllm)
