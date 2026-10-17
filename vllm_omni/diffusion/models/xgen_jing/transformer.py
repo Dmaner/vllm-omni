@@ -131,13 +131,15 @@ class XGenJingDiTModel(MiniMaxH3DiTModel):
         attention_config = od_config.diffusion_attention_config
         for role, category in (("self", None), ("minimax_h3.token_refiner", "self")):
             spec, source = attention_config.resolve_with_source(role=role, role_category=category)
-            if spec is None or spec.backend.upper() != "TORCH_SDPA" or spec.quant is not None:
+            allowed = {"TORCH_SDPA", "FLASH_ATTN"} if role == "self" else {"TORCH_SDPA"}
+            if spec is None or spec.backend.upper() not in allowed or spec.quant is not None:
                 raise ValueError(
-                    f"XGEN-JING requires explicit TORCH_SDPA without attention quantization for role {role!r} "
-                    f"(resolved from {source or 'platform default'}). "
-                    "Set diffusion_attention_config.default.backend='TORCH_SDPA' "
-                    "and remove conflicting per-role overrides."
+                    f"XGEN-JING requires an explicit backend in {sorted(allowed)} without attention quantization "
+                    f"for role {role!r} (resolved from {source or 'platform default'}). "
+                    "FLASH_ATTN on JING's main blocks means CuTe FA4; the token refiner must remain TORCH_SDPA."
                 )
+            if spec.backend.upper() == "FLASH_ATTN" and spec.backend_kwargs():
+                raise ValueError("JING CuTe FA4 does not accept backend-specific options")
         self.od_config, self.parallel_config = od_config, parallel
         self._diffusers_weights = True
         self._rope_theta = float(config.get("rope_theta", 10000.0))

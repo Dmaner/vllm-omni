@@ -2,11 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Slice-local text visibility without allocating a quadratic attention mask."""
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch.nn import functional as F
 
+from vllm_omni.diffusion.config import get_current_diffusion_config_or_none
 from vllm_omni.diffusion.distributed.parallel_state import get_sp_group
-from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Attention
+from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import MiniMaxH3Attention, MiniMaxH3DiTArchConfig
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 AttentionGroups = tuple[tuple[torch.Tensor, torch.Tensor], ...]
 
@@ -45,6 +51,27 @@ def gather_sequence_rows(rows: torch.Tensor, world_size: int, total: int) -> tor
 
 
 class JingAttention(MiniMaxH3Attention):
+    def __init__(
+        self,
+        arch: MiniMaxH3DiTArchConfig,
+        quant_config: "QuantizationConfig | None",
+        *,
+        prefix: str,
+        skip_sequence_parallel: bool = False,
+    ) -> None:
+        super().__init__(arch, quant_config, prefix=prefix, skip_sequence_parallel=skip_sequence_parallel)
+        backend = self.attention.attn_backend.get_name()
+        self.jing_fa4 = None
+        if backend == "FLASH_ATTN":
+            from .fa4 import JingFA4Attention
+
+            config = get_current_diffusion_config_or_none()
+            deterministic = bool(getattr(config, "fa_deterministic", False))
+            self.jing_fa4 = JingFA4Attention(self.num_heads, self.head_dim, deterministic=deterministic)
+        elif backend not in {"TORCH_SDPA", "SDPA"}:
+            raise ValueError(f"Unsupported JING attention backend: {backend}")
+        self.jing_attention_kernel = "torch_sdpa" if self.jing_fa4 is None else "flash_attn.cute.flash_attn_func"
+
     def _apply_cached_rope(self, x: torch.Tensor, rotary: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         cos, sin = rotary
         expected = (x.shape[0], self.rot_dim)
@@ -82,10 +109,21 @@ class JingAttention(MiniMaxH3Attention):
         v = gather_sequence_rows(v, world_size, total_rows)
         output = torch.zeros_like(q)
         for query_rows, key_rows in groups:
-            query = q.index_select(0, query_rows).transpose(0, 1).unsqueeze(0)
-            key = k.index_select(0, key_rows).transpose(0, 1).unsqueeze(0)
-            value = v.index_select(0, key_rows).transpose(0, 1).unsqueeze(0)
-            attended = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
-            output.index_copy_(0, query_rows, attended.squeeze(0).transpose(0, 1))
+            if self.jing_fa4 is None:
+                query = q.index_select(0, query_rows).transpose(0, 1).unsqueeze(0)
+                key = k.index_select(0, key_rows).transpose(0, 1).unsqueeze(0)
+                value = v.index_select(0, key_rows).transpose(0, 1).unsqueeze(0)
+                attended = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
+                output.index_copy_(0, query_rows, attended.squeeze(0).transpose(0, 1))
+            else:
+                # Each visibility group is one dense rectangular attention:
+                # local Q rows, global media plus that slice's text K/V rows.
+                # Keep BSND and run no extra SP operation inside the kernel.
+                attended = self.jing_fa4(
+                    q.index_select(0, query_rows).unsqueeze(0),
+                    k.index_select(0, key_rows).unsqueeze(0),
+                    v.index_select(0, key_rows).unsqueeze(0),
+                )
+                output.index_copy_(0, query_rows, attended.squeeze(0))
         result, _ = self.out_proj(output.flatten(1))
         return result
