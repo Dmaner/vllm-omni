@@ -15,6 +15,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_rank
 from vllm_omni.diffusion.layers.norm import RMSNorm
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
+from vllm_omni.diffusion.models.minimax_h3.adaln_cache import MiniMaxH3RuntimeAdalnCache
 from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
     MiniMaxH3AdalnProj,
     MiniMaxH3DiTArchConfig,
@@ -38,7 +39,14 @@ if TYPE_CHECKING:
 
 
 class JingDiTBlock(nn.Module):
-    def __init__(self, arch: MiniMaxH3DiTArchConfig, quant_config: "QuantizationConfig | None", *, prefix: str) -> None:
+    def __init__(
+        self,
+        arch: MiniMaxH3DiTArchConfig,
+        quant_config: "QuantizationConfig | None",
+        *,
+        prefix: str,
+        adaln_cache: MiniMaxH3RuntimeAdalnCache | None = None,
+    ) -> None:
         super().__init__()
         self.norm1 = RMSNorm(arch.hidden_size, eps=arch.norm_eps, dtype=torch.bfloat16)
         self.norm2 = RMSNorm(arch.hidden_size, eps=arch.norm_eps, dtype=torch.bfloat16)
@@ -46,7 +54,13 @@ class JingDiTBlock(nn.Module):
         self.mlp = MiniMaxH3MLP(arch, quant_config, prefix=f"{prefix}.mlp")
         # Shift/scale/gate projections retain the checkpoint precision.
         self.adaln_proj = MiniMaxH3AdalnProj(
-            arch, arch.adaln_out_features, None, expand_ratio=6, modality_num=3, prefix=f"{prefix}.adaln_proj"
+            arch,
+            arch.adaln_out_features,
+            None,
+            expand_ratio=6,
+            modality_num=3,
+            prefix=f"{prefix}.adaln_proj",
+            adaln_cache=adaln_cache,
         )
 
     def forward(
@@ -128,7 +142,16 @@ class XGenJingDiTModel(MiniMaxH3DiTModel):
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.latents_dim
-        self.adaln_cache = None
+        cache_enabled = od_config.model_config.get("xgen_jing_adaln_cache", False)
+        cache_bytes = od_config.model_config.get("xgen_jing_adaln_cache_max_bytes", 256 * 1024**2)
+        if type(cache_enabled) is not bool:
+            raise TypeError("model_config.xgen_jing_adaln_cache must be a boolean")
+        if type(cache_bytes) is not int or cache_bytes < 0:
+            raise ValueError("model_config.xgen_jing_adaln_cache_max_bytes must be a nonnegative integer")
+        # Reuse the exact H3 cache: actual embedding bytes, weight/storage
+        # versions and numerical settings identify entries. TP ranks vote on
+        # hits before any rank skips the projection's gather collective.
+        self.adaln_cache = MiniMaxH3RuntimeAdalnCache(max_bytes=cache_bytes) if cache_enabled else None
         self.vsa_gates_enabled = False
         self.video_patch_proj = ColumnParallelLinear(
             arch.latents_dim * arch.patch_size[0] * arch.patch_size[1] * arch.patch_size[2],
@@ -161,9 +184,12 @@ class XGenJingDiTModel(MiniMaxH3DiTModel):
         self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
         self.token_refiner = MiniMaxH3TokenRefiner(arch, None, prefix="token_refiner")
         self.blocks = nn.ModuleList(
-            [JingDiTBlock(arch, quant_config, prefix=f"blocks.{index}") for index in range(arch.num_layers)]
+            [
+                JingDiTBlock(arch, quant_config, prefix=f"blocks.{index}", adaln_cache=self.adaln_cache)
+                for index in range(arch.num_layers)
+            ]
         )
-        self.final_layer = MiniMaxH3FinalLayer(arch, None, prefix="final_layer")
+        self.final_layer = MiniMaxH3FinalLayer(arch, None, prefix="final_layer", adaln_cache=self.adaln_cache)
         control_config = config.get("control_config")
         if not isinstance(control_config, Mapping):
             raise ValueError("Missing JING control_config; use the JING transformer config rather than base H3")
@@ -391,6 +417,8 @@ class XGenJingDiTModel(MiniMaxH3DiTModel):
             time_embedding = self.time_embedder(timestep.flatten())
             camera, camera_rows, groups = fixed.camera, fixed.camera_rows, fixed.groups
             rotary = (fixed.rope_cos, fixed.rope_sin)
+        if self.adaln_cache is not None:
+            self.adaln_cache.prepare(time_embedding)
         for index, block in enumerate(self.blocks):
             hidden = block(
                 hidden,
