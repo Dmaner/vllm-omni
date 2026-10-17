@@ -45,6 +45,18 @@ def gather_sequence_rows(rows: torch.Tensor, world_size: int, total: int) -> tor
 
 
 class JingAttention(MiniMaxH3Attention):
+    def _apply_cached_rope(self, x: torch.Tensor, rotary: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        cos, sin = rotary
+        expected = (x.shape[0], self.rot_dim)
+        if cos.shape != expected or sin.shape != expected or cos.dtype != x.dtype or sin.dtype != x.dtype:
+            raise ValueError("JING cached RoPE must match the original activation dtype and local row geometry")
+        if cos.device != x.device or sin.device != x.device:
+            raise ValueError("JING cached RoPE and activations must share a device")
+        # Same native RotaryEmbedding dispatch and concat as H3 _apply_rope;
+        # only the immutable cos/sin construction has moved out of the blocks.
+        rotated = self.rope(x[..., : self.rot_dim], cos, sin)
+        return torch.cat((rotated, x[..., self.rot_dim :]), dim=-1)
+
     def forward(
         self,
         hidden: torch.Tensor,
@@ -53,12 +65,17 @@ class JingAttention(MiniMaxH3Attention):
         groups: AttentionGroups,
         world_size: int,
         total_rows: int,
+        rotary: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         projected, _ = self.qkv_proj(hidden)
         width = self.num_heads * self.head_dim
         q, k, v = (part.reshape(-1, self.num_heads, self.head_dim) for part in projected.split(width, dim=-1))
-        q = self._apply_rope(self.q_norm(q), freqs)
-        k = self._apply_rope(self.k_norm(k), freqs)
+        if rotary is None:
+            q = self._apply_rope(self.q_norm(q), freqs)
+            k = self._apply_rope(self.k_norm(k), freqs)
+        else:
+            q = self._apply_cached_rope(self.q_norm(q), rotary)
+            k = self._apply_cached_rope(self.k_norm(k), rotary)
         # Q stays local while each rank needs K/V for global media and the
         # selected slice text. TP already partitions heads independently.
         k = gather_sequence_rows(k, world_size, total_rows)

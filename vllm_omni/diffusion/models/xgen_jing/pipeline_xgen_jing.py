@@ -31,6 +31,7 @@ from vllm_omni.model_executor.model_loader.weight_utils import download_weights_
 from vllm_omni.quantization.component_config import ComponentQuantizationConfig, resolve_component_quant_config
 
 from .packing import JingPackedInputs, audio_endpoint, chunk_lengths, expand_slices, pack
+from .request_cache import JingRequestCache, request_cache_enabled
 from .transformer import XGenJingDiTModel
 
 _H3_COMPONENTS = ("text_encoder", "tokenizer", "processor", "vae", "audio_vae", "scheduler", "audio_scheduler")
@@ -192,6 +193,8 @@ class XGenJingPipeline(
             )
         self.device = get_local_device()
         self.parallel_config = od_config.parallel_config
+        self._request_cache_enabled = request_cache_enabled(od_config.model_config)
+        self._last_request_cache_stats: dict[str, int | bool] | None = None
         self._vae_cpu_offload = od_config.model_config.get("xgen_jing_vae_cpu_offload", False)
         if type(self._vae_cpu_offload) is not bool:
             raise TypeError("model_config.xgen_jing_vae_cpu_offload must be a boolean")
@@ -477,6 +480,8 @@ class XGenJingPipeline(
             scheduler.set_timesteps(sigmas=shifted, device=self.device)
             if len(scheduler.timesteps) != 4:
                 raise RuntimeError("The H3 scheduler must produce four timesteps for jing_flash_v1")
+        request_cache = JingRequestCache(self.transformer, packed) if self._request_cache_enabled else None
+        self._last_request_cache_stats = None
         try:
             with self.progress_bar(total=4) as progress:
                 for index, (video_time, audio_time) in enumerate(
@@ -485,7 +490,12 @@ class XGenJingPipeline(
                     check_request_cancellation(synchronize=True)
                     self.record_denoise_step(index, normalized_timestep=video_time.item(), total_steps=4)
                     timesteps, timestep_indices = packed.timesteps(video_time, audio_time, 0.0)
-                    video_prediction, audio_prediction = self.transformer(packed, timesteps, timestep_indices)
+                    if request_cache is None:
+                        video_prediction, audio_prediction = self.transformer(packed, timesteps, timestep_indices)
+                    else:
+                        video_prediction, audio_prediction = self.transformer(
+                            packed, timesteps, timestep_indices, request_cache=request_cache
+                        )
                     generated = slice(packed.output_video_offset, None)
                     packed.video[:, generated] = self.scheduler.step(
                         video_prediction[:, generated].float(),
@@ -498,6 +508,9 @@ class XGenJingPipeline(
                     )[0]
                     progress.update()
         finally:
+            if request_cache is not None:
+                request_cache.close()
+                self._last_request_cache_stats = request_cache.scalar_stats()
             self.record_denoise_step(None, total_steps=None)
         if not torch.isfinite(packed.video).all() or not torch.isfinite(packed.audio).all():
             raise FloatingPointError("XGEN-JING produced non-finite latents")

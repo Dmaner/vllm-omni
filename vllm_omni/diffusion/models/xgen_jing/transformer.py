@@ -29,6 +29,7 @@ from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
 from .attention import AttentionGroups, JingAttention, build_attention_groups, gather_sequence_rows
 from .control import JingCameraFiLM, JingControl
 from .packing import JingPackedInputs
+from .request_cache import JingFixedConditioning, JingRequestCache
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -61,6 +62,7 @@ class JingDiTBlock(nn.Module):
         camera: torch.Tensor,
         camera_rows: torch.Tensor,
         injector: JingCameraFiLM,
+        rotary: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = (
             values.index_select(0, modality_indices) for values in self.adaln_proj(time_embedding)
@@ -71,6 +73,7 @@ class JingDiTBlock(nn.Module):
             groups=groups,
             world_size=world_size,
             total_rows=total_rows,
+            rotary=rotary,
         )
         hidden = hidden + gate_a * attended
         # FiLM conditions the FFN input; the residual retains the attention
@@ -269,12 +272,47 @@ class XGenJingDiTModel(MiniMaxH3DiTModel):
         self.post_load_weights()
         return loaded
 
+    def _prepare_fixed_conditioning(
+        self,
+        packed: JingPackedInputs,
+        *,
+        start: int,
+        end: int,
+        padding: int,
+        local_length: int,
+    ) -> JingFixedConditioning:
+        # Keep the full packed GEMM and original per-slice refiner batch shapes.
+        projected_text, _ = self.condition_proj(packed.text[0].to(torch.bfloat16))
+        refined = []
+        for text in projected_text.split(packed.text_lengths):
+            boundaries = torch.tensor([0, len(text)], dtype=torch.int32, device=text.device)
+            refined.append(self.token_refiner(text, cu_seqlens=boundaries, max_seqlen=len(text)))
+        positions = F.pad(packed.position_ids, (0, 0, 0, padding))[start:end]
+        freqs = self.rope(positions.unsqueeze(0))
+        camera, camera_rows = self.control(packed.controls)
+        local_camera = (camera_rows >= start) & (camera_rows < end)
+        camera, camera_rows = camera[local_camera], camera_rows[local_camera] - start
+        groups = build_attention_groups(packed.owners, packed.is_media, local_start=start, local_length=local_length)
+        # H3 casts both trigonometric outputs to q/k's BF16 dtype before the
+        # same native rotary operator. Do not change the dispatch or math.
+        return JingFixedConditioning(
+            refined_text=torch.cat(refined),
+            freqs=freqs,
+            rope_cos=torch.cos(freqs).to(projected_text.dtype),
+            rope_sin=torch.sin(freqs).to(projected_text.dtype),
+            camera=camera,
+            camera_rows=camera_rows,
+            groups=groups,
+        )
+
     def forward(
         self,
         packed: JingPackedInputs,
         timestep: torch.Tensor,
         timestep_indices: torch.Tensor,
         attention_groups: AttentionGroups | None = None,
+        *,
+        request_cache: JingRequestCache | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         total_rows = packed.token_tags.numel()
         if timestep_indices.shape != (total_rows,):
@@ -288,34 +326,71 @@ class XGenJingDiTModel(MiniMaxH3DiTModel):
         padding = local_length * world_size - total_rows
         video, _ = self.video_patch_proj(packed.video[0].float())
         audio, _ = self.audio_patch_proj(packed.audio[0].float())
-        projected_text, _ = self.condition_proj(packed.text[0].to(torch.bfloat16))
-        refined = []
-        for text in projected_text.split(packed.text_lengths):
-            boundaries = torch.tensor([0, len(text)], dtype=torch.int32, device=text.device)
-            refined.append(self.token_refiner(text, cu_seqlens=boundaries, max_seqlen=len(text)))
-        hidden = projected_text.new_zeros((total_rows + padding, self.hidden_size))
-        for indices, values in (
-            (packed.video_indices, video),
-            (packed.audio_indices, audio),
-            (packed.text_indices, torch.cat(refined)),
-        ):
-            hidden.index_copy_(0, indices, values.to(hidden.dtype))
-        hidden = hidden[start:end].contiguous()
-        positions = F.pad(packed.position_ids, (0, 0, 0, padding))[start:end]
-        freqs = self.rope(positions.unsqueeze(0))
-        local_times = F.pad(timestep_indices, (0, padding))[start:end]
-        modality_indices = F.pad(timestep_indices * 3 + packed.token_tags, (0, padding))[start:end]
-        time_embedding = self.time_embedder(timestep.flatten())
-        camera, camera_rows = self.control(packed.controls)
-        local_camera = (camera_rows >= start) & (camera_rows < end)
-        camera, camera_rows = camera[local_camera], camera_rows[local_camera] - start
-        if attention_groups is not None and world_size != 1:
-            raise ValueError("For JING SP, omit attention_groups so each rank derives its local query groups")
-        groups = (
-            attention_groups
-            if attention_groups is not None
-            else build_attention_groups(packed.owners, packed.is_media, local_start=start, local_length=local_length)
-        )
+        if request_cache is None:
+            projected_text, _ = self.condition_proj(packed.text[0].to(torch.bfloat16))
+            refined = []
+            for text in projected_text.split(packed.text_lengths):
+                boundaries = torch.tensor([0, len(text)], dtype=torch.int32, device=text.device)
+                refined.append(self.token_refiner(text, cu_seqlens=boundaries, max_seqlen=len(text)))
+            hidden = projected_text.new_zeros((total_rows + padding, self.hidden_size))
+            for indices, values in (
+                (packed.video_indices, video),
+                (packed.audio_indices, audio),
+                (packed.text_indices, torch.cat(refined)),
+            ):
+                hidden.index_copy_(0, indices, values.to(hidden.dtype))
+            hidden = hidden[start:end].contiguous()
+            positions = F.pad(packed.position_ids, (0, 0, 0, padding))[start:end]
+            freqs = self.rope(positions.unsqueeze(0))
+            local_times = F.pad(timestep_indices, (0, padding))[start:end]
+            modality_indices = F.pad(timestep_indices * 3 + packed.token_tags, (0, padding))[start:end]
+            time_embedding = self.time_embedder(timestep.flatten())
+            camera, camera_rows = self.control(packed.controls)
+            local_camera = (camera_rows >= start) & (camera_rows < end)
+            camera, camera_rows = camera[local_camera], camera_rows[local_camera] - start
+            if attention_groups is not None and world_size != 1:
+                raise ValueError("For JING SP, omit attention_groups so each rank derives its local query groups")
+            groups = (
+                attention_groups
+                if attention_groups is not None
+                else build_attention_groups(
+                    packed.owners, packed.is_media, local_start=start, local_length=local_length
+                )
+            )
+            rotary = None
+        else:
+            if attention_groups is not None:
+                raise ValueError("JING request caching derives its attention groups from the bound packed request")
+            geometry = (
+                total_rows,
+                world_size,
+                rank,
+                local_length,
+                start,
+                end,
+                padding,
+                get_tensor_model_parallel_world_size(),
+            )
+            fixed = request_cache.get(self, packed, geometry)
+            if fixed is None:
+                fixed = self._prepare_fixed_conditioning(
+                    packed, start=start, end=end, padding=padding, local_length=local_length
+                )
+                request_cache.store(fixed)
+            hidden = fixed.refined_text.new_zeros((total_rows + padding, self.hidden_size))
+            for indices, values in (
+                (packed.video_indices, video),
+                (packed.audio_indices, audio),
+                (packed.text_indices, fixed.refined_text),
+            ):
+                hidden.index_copy_(0, indices, values.to(hidden.dtype))
+            hidden = hidden[start:end].contiguous()
+            freqs = fixed.freqs
+            local_times = F.pad(timestep_indices, (0, padding))[start:end]
+            modality_indices = F.pad(timestep_indices * 3 + packed.token_tags, (0, padding))[start:end]
+            time_embedding = self.time_embedder(timestep.flatten())
+            camera, camera_rows, groups = fixed.camera, fixed.camera_rows, fixed.groups
+            rotary = (fixed.rope_cos, fixed.rope_sin)
         for index, block in enumerate(self.blocks):
             hidden = block(
                 hidden,
@@ -328,6 +403,7 @@ class XGenJingDiTModel(MiniMaxH3DiTModel):
                 camera=camera,
                 camera_rows=camera_rows,
                 injector=self.control.block_injectors[index],
+                rotary=rotary,
             )
         video_pred, audio_pred = self.final_layer(hidden, t_emb=time_embedding, inverse_indices=local_times)
         predictions = gather_sequence_rows(torch.cat((video_pred, audio_pred), dim=-1), world_size, total_rows)
