@@ -37,12 +37,13 @@ if TYPE_CHECKING:
 
 
 class JingDiTBlock(nn.Module):
-    def __init__(self, arch: MiniMaxH3DiTArchConfig, *, prefix: str) -> None:
+    def __init__(self, arch: MiniMaxH3DiTArchConfig, quant_config: "QuantizationConfig | None", *, prefix: str) -> None:
         super().__init__()
         self.norm1 = RMSNorm(arch.hidden_size, eps=arch.norm_eps, dtype=torch.bfloat16)
         self.norm2 = RMSNorm(arch.hidden_size, eps=arch.norm_eps, dtype=torch.bfloat16)
-        self.attn = JingAttention(arch, None, prefix=f"{prefix}.attn", skip_sequence_parallel=True)
-        self.mlp = MiniMaxH3MLP(arch, None, prefix=f"{prefix}.mlp")
+        self.attn = JingAttention(arch, quant_config, prefix=f"{prefix}.attn", skip_sequence_parallel=True)
+        self.mlp = MiniMaxH3MLP(arch, quant_config, prefix=f"{prefix}.mlp")
+        # Shift/scale/gate projections retain the checkpoint precision.
         self.adaln_proj = MiniMaxH3AdalnProj(
             arch, arch.adaln_out_features, None, expand_ratio=6, modality_num=3, prefix=f"{prefix}.adaln_proj"
         )
@@ -96,8 +97,7 @@ class XGenJingDiTModel(MiniMaxH3DiTModel):
         # the H3 constructor and replacing its blocks would allocate a second
         # full transformer while the first one is still resident.
         nn.Module.__init__(self)
-        if quant_config is not None:
-            raise ValueError("JING's initial integration supports unquantized BF16 transformer weights")
+        self._validate_quant_config(quant_config)
         if not diffusers_weights:
             raise ValueError("JING requires its released Diffusers-format transformer checkpoint")
         parallel = od_config.parallel_config
@@ -157,7 +157,9 @@ class XGenJingDiTModel(MiniMaxH3DiTModel):
         self.time_embedder = MiniMaxH3TimeEmbedder(arch, prefix="time_embedder")
         self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
         self.token_refiner = MiniMaxH3TokenRefiner(arch, None, prefix="token_refiner")
-        self.blocks = nn.ModuleList([JingDiTBlock(arch, prefix=f"blocks.{index}") for index in range(arch.num_layers)])
+        self.blocks = nn.ModuleList(
+            [JingDiTBlock(arch, quant_config, prefix=f"blocks.{index}") for index in range(arch.num_layers)]
+        )
         self.final_layer = MiniMaxH3FinalLayer(arch, None, prefix="final_layer")
         control_config = config.get("control_config")
         if not isinstance(control_config, Mapping):
@@ -165,7 +167,71 @@ class XGenJingDiTModel(MiniMaxH3DiTModel):
         self.control = JingControl(
             control_config, hidden_size=arch.hidden_size, num_layers=arch.num_layers, patch_size=arch.patch_size
         )
+        self._online_fp8_shapes: dict[str, tuple[int, ...]] = {}
+        if quant_config is not None:
+            from vllm.model_executor.layers.quantization.online.fp8 import Fp8PerTensorOnlineLinearMethod
+
+            for index, block in enumerate(self.blocks):
+                for suffix, layer in (
+                    ("attn.qkv_proj", block.attn.qkv_proj),
+                    ("attn.out_proj", block.attn.out_proj),
+                    ("mlp.fc1", block.mlp.fc1),
+                    ("mlp.fc2", block.mlp.fc2),
+                ):
+                    method = layer.quant_method
+                    if isinstance(method, Fp8PerTensorOnlineLinearMethod):
+                        if method.use_marlin:
+                            raise ValueError(
+                                "JING online FP8 requires a native FP8 linear kernel, not Marlin repacking"
+                            )
+                        self._online_fp8_shapes[f"blocks.{index}.{suffix}"] = tuple(layer.weight.shape)
+        # Online FP8 adds scales while consuming the checkpoint stream. Keep
+        # the original targets so generated parameters cannot hide a missing
+        # source tensor or become mistaken for checkpoint requirements.
+        self._checkpoint_parameter_names = frozenset(name for name, _ in self.named_parameters())
         self._mark_missing_params_required()
+
+    @staticmethod
+    def _validate_quant_config(quant_config: "QuantizationConfig | None") -> None:
+        if quant_config is None:
+            return
+        from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+        from vllm.model_executor.layers.quantization.utils.quant_utils import kFp8StaticTensorSym
+
+        if (
+            not isinstance(quant_config, OnlineQuantizationConfig)
+            or quant_config.args.targets is not None
+            or quant_config.args.linear is None
+            or quant_config.args.linear.weight != kFp8StaticTensorSym
+            or quant_config.args.linear.activation is not None
+        ):
+            raise ValueError(
+                "JING supports only online per-tensor FP8 with dynamic activations for main-block attention/MLP; "
+                "use quantization='fp8' with optional ignored_layers"
+            )
+
+    def _validate_online_fp8_weights(self) -> set[str]:
+        """Return only scales generated by a completed, supported conversion."""
+        generated: set[str] = set()
+        for name, checkpoint_shape in self._online_fp8_shapes.items():
+            layer = self.get_submodule(name)
+            weight = layer.weight
+            scale = getattr(layer, "weight_scale", None)
+            if (
+                not getattr(layer, "_already_called_process_weights_after_loading", False)
+                or weight.is_meta
+                or weight.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+                or tuple(weight.shape) != checkpoint_shape[::-1]
+                or not isinstance(scale, nn.Parameter)
+                or scale.is_meta
+                or scale.dtype != torch.float32
+                or scale.numel() != 1
+                or not bool((torch.isfinite(scale) & (scale > 0)).all().item())
+                or getattr(layer, "input_scale", None) is not None
+            ):
+                raise ValueError(f"Incomplete or invalid JING online FP8 conversion: {name}")
+            generated.add(f"{name}.weight_scale")
+        return generated
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         camera_parameters = dict(self.control.named_parameters(prefix="control"))
@@ -186,9 +252,21 @@ class XGenJingDiTModel(MiniMaxH3DiTModel):
                     yield name, weight
 
         loaded = super().load_weights(base_weights()) | loaded_camera
-        missing = set(dict(self.named_parameters())) - loaded
+        missing = self._checkpoint_parameter_names - loaded
         if missing:
             raise ValueError(f"Incomplete JING checkpoint; missing {len(missing)} tensors: {sorted(missing)[:8]}")
+        if self._online_fp8_shapes:
+            from vllm.model_executor.model_loader.reload.layerwise import finalize_layerwise_processing
+
+            # Most linears finish in their weight_loader. Finalize stragglers
+            # only after verifying the real checkpoint is complete. The outer
+            # diffusion loader can safely repeat this native, idempotent step.
+            finalize_layerwise_processing(self, model_config=None)
+        generated = self._validate_online_fp8_weights()
+        unexpected = set(dict(self.named_parameters())) - loaded - generated
+        if unexpected:
+            raise ValueError(f"Uninitialized JING parameters after loading: {sorted(unexpected)[:8]}")
+        self.post_load_weights()
         return loaded
 
     def forward(

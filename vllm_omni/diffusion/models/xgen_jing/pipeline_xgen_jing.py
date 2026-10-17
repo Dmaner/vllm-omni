@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -21,12 +22,13 @@ from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineL
 from vllm_omni.diffusion.models.interface import SupportAudioOutput, SupportImageInput, SupportsComponentDiscovery
 from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import get_minimax_h3_post_process_func
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
-from vllm_omni.diffusion.offloader import OffloadPlan
+from vllm_omni.diffusion.offloader import OffloadConfig, OffloadPlan, OffloadStrategy
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
+from vllm_omni.quantization.component_config import ComponentQuantizationConfig, resolve_component_quant_config
 
 from .packing import JingPackedInputs, audio_endpoint, chunk_lengths, expand_slices, pack
 from .transformer import XGenJingDiTModel
@@ -190,10 +192,28 @@ class XGenJingPipeline(
             )
         self.device = get_local_device()
         self.parallel_config = od_config.parallel_config
+        self._vae_cpu_offload = od_config.model_config.get("xgen_jing_vae_cpu_offload", False)
+        if type(self._vae_cpu_offload) is not bool:
+            raise TypeError("model_config.xgen_jing_vae_cpu_offload must be a boolean")
+        if self._vae_cpu_offload:
+            if self.device.type != "cuda":
+                raise ValueError("XGEN-JING VAE CPU offload currently requires a CUDA execution device")
+            if self.parallel_config.use_hsdp or od_config.enable_cuda_graph_decode:
+                raise ValueError("XGEN-JING VAE CPU offload requires HSDP and CUDA graph decode to be disabled")
+            if od_config.diffusion_load_format != "default":
+                raise ValueError("XGEN-JING VAE CPU offload requires the native default load format")
+            # These registered VAEs are staged explicitly below. Exclude them
+            # from discovery's always-resident VAE list so a shared offloader
+            # cannot move them back to the accelerator after construction.
+            self._vae_modules = []
         if od_config.dtype != torch.bfloat16:
             raise ValueError("XGEN-JING currently requires dtype=bfloat16")
-        if od_config.quantization_config is not None:
-            raise ValueError("XGEN-JING currently supports unquantized transformer and encoder weights")
+        quant_config = od_config.quantization_config
+        if isinstance(quant_config, ComponentQuantizationConfig) and any(
+            quant_config.resolve(name) is not None for name in ("text_encoder", "vae", "video_vae", "audio_vae")
+        ):
+            raise ValueError("XGEN-JING online FP8 requires text_encoder and both VAEs to remain unquantized")
+        transformer_quant_config = resolve_component_quant_config(quant_config, "transformer")
         if od_config.cache_backend not in (None, "none"):
             raise ValueError("XGEN-JING does not yet support diffusion cache backends")
         if od_config.lora_path:
@@ -209,7 +229,7 @@ class XGenJingPipeline(
         self.api = _h3_api()
         self.architecture = od_config.tf_model_config.to_dict()
         self.patch_size = tuple(self.architecture["patch_size"])
-        self.transformer = XGenJingDiTModel(od_config, diffusers_weights=True)
+        self.transformer = XGenJingDiTModel(od_config, quant_config=transformer_quant_config, diffusers_weights=True)
         model_path = Path(str(od_config.model)).expanduser()
         # Both the Hub repository root and a directly selected jing_flash_v1
         # directory use the same native checkpoint stream.
@@ -227,6 +247,10 @@ class XGenJingPipeline(
         # Honor the loader's CPU/offload/HSDP placement context, while avoiding
         # safetensors' direct-to-device allocations for pretrained components.
         load_device = torch.empty(0).device
+        offload_config = OffloadConfig.from_od_config(od_config)
+        offload_encoder = offload_config.strategy is not OffloadStrategy.NONE and offload_config.should_offload_encoder(
+            "text_encoder", self._offload_plan
+        )
         with torch.device("cpu"):
             tokenizer = Qwen2TokenizerFast.from_pretrained(root / "tokenizer", local_files_only=True)
             processor = Qwen3VLProcessor.from_pretrained(root / "processor", local_files_only=True)
@@ -253,9 +277,14 @@ class XGenJingPipeline(
                 .eval()
                 .requires_grad_(False)
             )
-        self.text_encoder.to(load_device)
-        self.video_vae.to(load_device)
-        self.audio_vae.to(load_device)
+        # Online quantization can select a CUDA construction device even when
+        # offload is enabled. Leave a selected encoder on CPU for the backend
+        # to stage; moving all its weights first defeats layerwise offload.
+        if not offload_encoder:
+            self.text_encoder.to(load_device)
+        if not self._vae_cpu_offload:
+            self.video_vae.to(load_device)
+            self.audio_vae.to(load_device)
         self.video_vae.enable_tiling()
         self.scheduler = self.api.scheduler.from_pretrained(root / "scheduler", local_files_only=True)
         self.audio_scheduler = self.api.scheduler.from_pretrained(root / "audio_scheduler", local_files_only=True)
@@ -269,6 +298,26 @@ class XGenJingPipeline(
     @property
     def vae(self):
         return self.video_vae
+
+    @contextmanager
+    def _vae_on_device(self, vae: nn.Module) -> Iterator[None]:
+        if not self._vae_cpu_offload:
+            yield
+            return
+        # Diffusers helpers call encode/decode directly, bypassing forward
+        # hooks. Keep the released FP32 weights and tile geometry unchanged.
+        try:
+            vae.to(self.device)
+            yield
+        finally:
+            # Also release partially moved weights if transfer or execution
+            # fails. A cleanup failure propagates rather than running on CPU.
+            vae.to("cpu")
+
+    def _offload_vaes(self) -> None:
+        if self._vae_cpu_offload:
+            self.video_vae.to("cpu")
+            self.audio_vae.to("cpu")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def transformer_weights():
@@ -374,12 +423,14 @@ class XGenJingPipeline(
             keyframe_encode_seed=42,
         )
         reference_encoder = self.api.reference_encoder()
-        for image in images:
-            check_request_cancellation(synchronize=True)
-            state = self.api.state()
-            state.set("keyframes", [image])
-            _, state = reference_encoder(components, state)
-            references.append(state.get("condition_latents")[0][0])
+        if images:
+            with self._vae_on_device(self.video_vae):
+                for image in images:
+                    check_request_cancellation(synchronize=True)
+                    state = self.api.state()
+                    state.set("keyframes", [image])
+                    _, state = reference_encoder(components, state)
+                    references.append(state.get("condition_latents")[0][0])
         return {**case, "text_bank": text_bank, "references": references}
 
     def _initial_inputs(self, conditioning: dict[str, Any], seed: int) -> JingPackedInputs:
@@ -416,6 +467,7 @@ class XGenJingPipeline(
 
     @torch.no_grad()
     def diffuse(self, packed: JingPackedInputs) -> tuple[torch.Tensor, torch.Tensor]:
+        self._offload_vaes()
         # Explicit sigmas include the clean endpoint. H3's timesteps are 1-sigma
         # and its velocity points toward data, so a generic flow scheduler is
         # not interchangeable with this scheduler.
@@ -483,9 +535,11 @@ class XGenJingPipeline(
         )
         check_request_cancellation(synchronize=True)
         _, state = self.api.after_denoise()(components, state)
-        _, state = self.api.video_decoder()(components, state)
+        with self._vae_on_device(self.video_vae):
+            _, state = self.api.video_decoder()(components, state)
         check_request_cancellation(synchronize=True)
-        _, state = self.api.audio_decoder()(components, state)
+        with self._vae_on_device(self.audio_vae):
+            _, state = self.api.audio_decoder()(components, state)
         video, audio = state.get("videos"), state.get("audio")
         if not torch.isfinite(video).all() or not torch.isfinite(audio).all():
             raise FloatingPointError("XGEN-JING decoded non-finite media")
