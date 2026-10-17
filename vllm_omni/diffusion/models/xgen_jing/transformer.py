@@ -11,6 +11,7 @@ from torch.nn import functional as F
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.triton_utils import HAS_TRITON
 
 from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_rank
 from vllm_omni.diffusion.layers.norm import RMSNorm
@@ -31,6 +32,7 @@ from vllm_omni.platforms import current_omni_platform
 
 from .attention import AttentionGroups, JingAttention, build_attention_groups, gather_sequence_rows
 from .control import JingCameraFiLM, JingControl
+from .fused_modulation import indexed_affine, indexed_residual
 from .packing import JingPackedInputs
 from .request_cache import JingFixedConditioning, JingRequestCache
 
@@ -48,8 +50,10 @@ class JingDiTBlock(nn.Module):
         *,
         prefix: str,
         adaln_cache: MiniMaxH3RuntimeAdalnCache | None = None,
+        fused_modulation: bool = False,
     ) -> None:
         super().__init__()
+        self.fused_modulation = fused_modulation
         self.norm1 = RMSNorm(arch.hidden_size, eps=arch.norm_eps, dtype=torch.bfloat16)
         self.norm2 = RMSNorm(arch.hidden_size, eps=arch.norm_eps, dtype=torch.bfloat16)
         self.attn = JingAttention(arch, quant_config, prefix=f"{prefix}.attn", skip_sequence_parallel=True)
@@ -80,6 +84,22 @@ class JingDiTBlock(nn.Module):
         injector: JingCameraFiLM,
         rotary: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        if self.fused_modulation:
+            shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = self.adaln_proj(time_embedding)
+            attended = self.attn(
+                indexed_affine(self.norm1(hidden), scale_a, shift_a, modality_indices),
+                freqs=freqs,
+                groups=groups,
+                world_size=world_size,
+                total_rows=total_rows,
+                rotary=rotary,
+            )
+            hidden = indexed_residual(hidden, attended, gate_a, modality_indices)
+            # Preserve camera FiLM between the attention residual and norm2;
+            # the residual itself must continue to use the pre-FiLM hidden.
+            conditioned = injector(hidden, camera, camera_rows)
+            branch = self.mlp(indexed_affine(self.norm2(conditioned), scale_f, shift_f, modality_indices))
+            return indexed_residual(hidden, branch, gate_f, modality_indices)
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = (
             values.index_select(0, modality_indices) for values in self.adaln_proj(time_embedding)
         )
@@ -146,6 +166,14 @@ class XGenJingDiTModel(MiniMaxH3DiTModel):
         self.hidden_size = arch.hidden_size
         self.num_attention_heads = arch.num_attention_heads
         self.num_channels_latents = arch.latents_dim
+        self.fused_modulation = od_config.model_config.get("xgen_jing_fused_modulation", False)
+        if type(self.fused_modulation) is not bool:
+            raise TypeError("model_config.xgen_jing_fused_modulation must be a boolean")
+        if self.fused_modulation:
+            if not HAS_TRITON or not current_omni_platform.is_cuda() or not od_config.enforce_eager:
+                raise ValueError("XGEN-JING fused modulation requires eager CUDA inference with Triton")
+            if od_config.dtype != torch.bfloat16:
+                raise ValueError("XGEN-JING fused modulation requires BF16 activations and modulation parameters")
         cache_enabled = od_config.model_config.get("xgen_jing_adaln_cache", False)
         cache_bytes = od_config.model_config.get("xgen_jing_adaln_cache_max_bytes", 256 * 1024**2)
         if type(cache_enabled) is not bool:
@@ -212,7 +240,13 @@ class XGenJingDiTModel(MiniMaxH3DiTModel):
         self.token_refiner = MiniMaxH3TokenRefiner(arch, None, prefix="token_refiner")
         self.blocks = nn.ModuleList(
             [
-                JingDiTBlock(arch, quant_config, prefix=f"blocks.{index}", adaln_cache=self.adaln_cache)
+                JingDiTBlock(
+                    arch,
+                    quant_config,
+                    prefix=f"blocks.{index}",
+                    adaln_cache=self.adaln_cache,
+                    fused_modulation=self.fused_modulation,
+                )
                 for index in range(arch.num_layers)
             ]
         )
