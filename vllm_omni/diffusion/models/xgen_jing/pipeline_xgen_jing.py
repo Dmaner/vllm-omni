@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -41,6 +42,7 @@ from vllm_omni.quantization.component_config import ComponentQuantizationConfig,
 
 from .packing import JingPackedInputs, audio_endpoint, chunk_lengths, expand_slices, pack
 from .request_cache import JingRequestCache, request_cache_enabled
+from .service_owner import JingRemoteTextConditioner, JingServiceGroup
 from .transformer import XGenJingDiTModel
 
 _H3_COMPONENTS = ("text_encoder", "tokenizer", "processor", "vae", "audio_vae", "scheduler", "audio_scheduler")
@@ -251,6 +253,30 @@ class XGenJingPipeline(
             raise ValueError("XGEN-JING's checkpoint mapping requires hsdp_weight_load_strategy=full")
         if any(not od_config.model_loaded.get(name, True) for name in ("text_encoder", "vae_encoder", "vae_decoder")):
             raise ValueError("XGEN-JING currently requires local text encoding and local VAE encoding/decoding")
+        self._service_owner_only = od_config.model_config.get("xgen_jing_service_owner_only", False)
+        if type(self._service_owner_only) is not bool:
+            raise TypeError("model_config.xgen_jing_service_owner_only must be a boolean")
+        self._owns_services = True
+        self._service_group = None
+        if self._service_owner_only:
+            if od_config.model_config.get("xgen_jing_output_rank_only_d2h", False) is not True:
+                raise ValueError("JING owner-only services require xgen_jing_output_rank_only_d2h=True")
+            output_owner = getattr(self, "_is_output_rank", None)
+            if not callable(output_owner):
+                raise ValueError("JING owner-only services require the output-owner routing implementation")
+            # The output-routing helper validates actual TP/SP/DP/PP/CFG group
+            # sizes and rejects HSDP. Do not infer ownership from global rank 0.
+            self._owns_services = output_owner()
+            offload = OffloadConfig.from_od_config(od_config)
+            if offload.strategy is not OffloadStrategy.LAYER_WISE or offload.components != frozenset({"text_encoder"}):
+                raise ValueError("JING owner-only services require ordinary layer offload selecting only text_encoder")
+            if not self._vae_cpu_offload or not od_config.enforce_eager or od_config.enable_cuda_graph_decode:
+                raise ValueError(
+                    "JING owner-only services require VAE CPU staging, enforce_eager=True and no CUDA graph decode"
+                )
+            if od_config.host_weight_runtime_mode != "disabled":
+                raise ValueError("JING owner-only services do not yet support Host Weight Runtime")
+            self._service_group = JingServiceGroup(is_owner=self._owns_services, device=self.device)
         self.api = _h3_api()
         self.architecture = od_config.tf_model_config.to_dict()
         self.patch_size = tuple(self.architecture["patch_size"])
@@ -276,6 +302,31 @@ class XGenJingPipeline(
         offload_encoder = offload_config.strategy is not OffloadStrategy.NONE and offload_config.should_offload_encoder(
             "text_encoder", self._offload_plan
         )
+        if self._service_group is None:
+            self._load_pretrained_services(root, load_device, offload_encoder)
+        else:
+            self.text_encoder = None
+            self.video_vae = None
+            self.audio_vae = None
+            self._service_group.run_owner(
+                "load_services", lambda: self._load_pretrained_services(root, load_device, offload_encoder)
+            )
+            if not self._owns_services:
+                self.text_encoder = JingRemoteTextConditioner()
+                # Explicit TE selection must remain a valid resolver topology
+                # on non-owners. The unloaded handle owns no model tensors.
+                self._offload_plan = replace(
+                    self._offload_plan,
+                    on_demand_component_paths=frozenset({"text_encoder"}),
+                )
+        self.scheduler = self.api.scheduler.from_pretrained(root / "scheduler", local_files_only=True)
+        self.audio_scheduler = self.api.scheduler.from_pretrained(root / "audio_scheduler", local_files_only=True)
+        self.video_processor = self.api.video_processor(vae_scale_factor=16, do_normalize=False)
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler
+        )
+
+    def _load_pretrained_services(self, root: Path, load_device: torch.device, offload_encoder: bool) -> None:
         with torch.device("cpu"):
             tokenizer = Qwen2TokenizerFast.from_pretrained(root / "tokenizer", local_files_only=True)
             processor = Qwen3VLProcessor.from_pretrained(root / "processor", local_files_only=True)
@@ -311,18 +362,27 @@ class XGenJingPipeline(
             self.video_vae.to(load_device)
             self.audio_vae.to(load_device)
         self.video_vae.enable_tiling()
-        self.scheduler = self.api.scheduler.from_pretrained(root / "scheduler", local_files_only=True)
-        self.audio_scheduler = self.api.scheduler.from_pretrained(root / "audio_scheduler", local_files_only=True)
-        self.video_processor = self.api.video_processor(vae_scale_factor=16, do_normalize=False)
         if self.audio_vae.config.sampling_rate != 32000:
             raise ValueError("XGEN-JING requires the H3 audio VAE with a 32000 Hz sample rate")
-        self.setup_diffusion_pipeline_profiler(
-            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler
-        )
 
     @property
     def vae(self):
         return self.video_vae
+
+    @property
+    def service_owner_stats(self) -> dict[str, Any]:
+        service = self._service_group
+        if service is None:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "is_owner": service.is_owner,
+            "owner_global_rank": service.owner_rank,
+            "group_ranks": None if service.group is None else list(service.group.ranks),
+            "owner_call_counts": dict(service.owner_call_counts),
+            "conditioning_broadcast_count": service.conditioning_broadcast_count,
+            "last_conditioning": service.last_conditioning,
+        }
 
     @contextmanager
     def _vae_on_device(self, vae: nn.Module) -> Iterator[None]:
@@ -340,7 +400,7 @@ class XGenJingPipeline(
             vae.to("cpu")
 
     def _offload_vaes(self) -> None:
-        if self._vae_cpu_offload:
+        if self._vae_cpu_offload and self._owns_services:
             self.video_vae.to("cpu")
             self.audio_vae.to("cpu")
 
@@ -430,6 +490,15 @@ class XGenJingPipeline(
 
     @torch.no_grad()
     def encode_conditioning(self, case: dict[str, Any]) -> dict[str, Any]:
+        if self._service_group is None:
+            return self._encode_conditioning_local(case)
+        check_request_cancellation(synchronize=True)
+        result = self._service_group.conditioning(case, lambda: self._encode_conditioning_local(case))
+        check_request_cancellation(synchronize=True)
+        return result
+
+    @torch.no_grad()
+    def _encode_conditioning_local(self, case: dict[str, Any]) -> dict[str, Any]:
         settings = case["settings"]
         images = [
             _prepare_image(image, settings["height"], settings["width"], stretch=index == 0)
@@ -540,6 +609,17 @@ class XGenJingPipeline(
 
     @torch.no_grad()
     def decode(self, video: torch.Tensor, audio: torch.Tensor, case: dict[str, Any]):
+        if self._service_group is None:
+            return self._decode_local(video, audio, case)
+        check_request_cancellation(synchronize=True)
+        result = self._service_group.run_owner("decode", lambda: self._decode_local(video, audio, case))
+        check_request_cancellation(synchronize=True)
+        # B's output-owner route waits at its error vote on every output. Only
+        # the owner may dereference/copy decoded media; peers retain no payload.
+        return (None, None) if not self._owns_services else result
+
+    @torch.no_grad()
+    def _decode_local(self, video: torch.Tensor, audio: torch.Tensor, case: dict[str, Any]):
         settings = case["settings"]
         frames = sum(case["lengths"])
         state = self.api.state()
