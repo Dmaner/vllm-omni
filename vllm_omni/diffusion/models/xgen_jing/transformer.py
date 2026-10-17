@@ -26,6 +26,8 @@ from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
     MiniMaxH3TimeEmbedder,
     MiniMaxH3TokenRefiner,
 )
+from vllm_omni.diffusion.offloader.config import DIT_COMPONENT, OffloadStrategy, resolve_offload
+from vllm_omni.platforms import current_omni_platform
 
 from .attention import AttentionGroups, JingAttention, build_attention_groups, gather_sequence_rows
 from .control import JingCameraFiLM, JingControl
@@ -148,10 +150,33 @@ class XGenJingDiTModel(MiniMaxH3DiTModel):
             raise TypeError("model_config.xgen_jing_adaln_cache must be a boolean")
         if type(cache_bytes) is not int or cache_bytes < 0:
             raise ValueError("model_config.xgen_jing_adaln_cache_max_bytes must be a nonnegative integer")
+        offload_adaln = od_config.model_config.get("xgen_jing_adaln_cpu_offload", False)
+        if type(offload_adaln) is not bool:
+            raise TypeError("model_config.xgen_jing_adaln_cpu_offload must be a boolean")
+        if offload_adaln:
+            offload = resolve_offload(od_config)
+            if not current_omni_platform.is_cuda() or not od_config.enforce_eager:
+                raise ValueError("XGEN-JING AdaLN CPU offload requires eager CUDA inference")
+            if od_config.dtype != torch.bfloat16:
+                raise ValueError("XGEN-JING AdaLN CPU offload requires BF16 modulation weights")
+            if parallel.use_hsdp or (offload.strategy is not OffloadStrategy.NONE and offload.offloads(DIT_COMPONENT)):
+                raise ValueError("XGEN-JING AdaLN CPU offload cannot be combined with HSDP or DiT offload")
+            if od_config.diffusion_load_format != "default":
+                raise ValueError("XGEN-JING AdaLN CPU offload requires the native default load format")
+            if getattr(od_config, "host_weight_runtime_mode", "disabled") != "disabled":
+                raise ValueError("XGEN-JING AdaLN CPU offload does not yet support Host Weight Runtime restores")
         # Reuse the exact H3 cache: actual embedding bytes, weight/storage
         # versions and numerical settings identify entries. TP ranks vote on
         # hits before any rank skips the projection's gather collective.
-        self.adaln_cache = MiniMaxH3RuntimeAdalnCache(max_bytes=cache_bytes) if cache_enabled else None
+        # All JING AdaLN constructors explicitly receive quant_config=None;
+        # main-block attention/MLP online FP8 does not quantize these weights.
+        # The two switches are independent: offload without caching stages the
+        # original projection on every call and may trade latency for memory.
+        self.adaln_cache = (
+            MiniMaxH3RuntimeAdalnCache(max_bytes=cache_bytes if cache_enabled else 0, offload_weights=offload_adaln)
+            if cache_enabled or offload_adaln
+            else None
+        )
         self.vsa_gates_enabled = False
         self.video_patch_proj = ColumnParallelLinear(
             arch.latents_dim * arch.patch_size[0] * arch.patch_size[1] * arch.patch_size[2],
@@ -297,6 +322,15 @@ class XGenJingDiTModel(MiniMaxH3DiTModel):
             raise ValueError(f"Uninitialized JING parameters after loading: {sorted(unexpected)[:8]}")
         self.post_load_weights()
         return loaded
+
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        if self.adaln_cache is not None and self.adaln_cache.offload_weights:
+            projections = [*(block.adaln_proj for block in self.blocks), self.final_layer.adaln_proj]
+            for projection in projections:
+                for name, parameter in projection.linear.named_parameters():
+                    if parameter.device.type != "cpu" or parameter.dtype != torch.bfloat16:
+                        raise ValueError(f"{projection._cache_name}.{name} must remain CPU BF16 with AdaLN offload")
 
     def _prepare_fixed_conditioning(
         self,
