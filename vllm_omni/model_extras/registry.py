@@ -110,6 +110,10 @@ from vllm_omni.model_extras.vace import (
     build_image_to_video_prompt as build_vace_image_to_video_prompt,
 )
 from vllm_omni.model_extras.video_generation import VideoGenerationDefaults
+from vllm_omni.model_extras.xgen_jing import (
+    XGEN_JING_EXTRA_BODY_PARAMS,
+    get_xgen_jing_video_generation_defaults,
+)
 
 TextToImagePromptBuilder = Callable[
     [str, str | None, int | None, int | None],
@@ -247,6 +251,11 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
         "extra_output_params": MAGI2_EXTRA_OUTPUT_PARAMS,
         "video_generation_defaults_builder": get_magi2_video_generation_defaults,
         "reference_image_size_resolver": magi2_preserves_reference_image_size,
+    },
+    "XGenJingPipeline": {
+        "extra_body_params": XGEN_JING_EXTRA_BODY_PARAMS,
+        "video_generation_defaults_builder": get_xgen_jing_video_generation_defaults,
+        "reference_image_size_resolver": _always_preserve_reference_image_size,
     },
     "HeliosPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,

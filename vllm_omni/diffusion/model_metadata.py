@@ -94,6 +94,11 @@ _DIFFUSION_MODEL_METADATA: dict[str, DiffusionModelMetadata] = {
         final_output_type="video",
         attention_mask_free=True,
     ),
+    "XGenJingPipeline": DiffusionModelMetadata(
+        supports_multimodal_inputs=True,
+        max_multimodal_image_inputs=5,
+        final_output_type="video",
+    ),
     "Magi2Pipeline": DiffusionModelMetadata(
         supports_multimodal_inputs=True,
         max_multimodal_image_inputs=1,

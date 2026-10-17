@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+import json
 import os
 from collections.abc import Mapping
 from functools import lru_cache
@@ -22,6 +23,7 @@ _MAGI2_REQUIRED_FILES = (
     "vae/Wan2.2_VAE.pth",
     "turbo_vae/checkpoint.ckpt",
 )
+_XGEN_JING_MODEL_ID = "XGENlabs/XGEN-JING"
 
 
 def get_diffusion_model_index(
@@ -73,8 +75,40 @@ def _looks_like_magi2(model_name: str) -> bool:
 
 def resolve_native_diffusion_model_class(model_name: str) -> str | None:
     """Resolve native checkpoints that have no root HF or Diffusers config."""
-
+    if _looks_like_xgen_jing(model_name):
+        return "XGenJingPipeline"
     return "Magi2Pipeline" if _looks_like_magi2(model_name) else None
+
+
+def _looks_like_xgen_jing(model_name: str) -> bool:
+    """Recognize JING's Hub ID and the camera-controlled local checkpoint."""
+    normalized = str(model_name).strip().rstrip("/")
+    if normalized.lower() == _XGEN_JING_MODEL_ID.lower():
+        return True
+    if not os.path.isdir(normalized):
+        return False
+    for folder in (os.path.join(normalized, "jing_flash_v1"), normalized):
+        try:
+            with open(os.path.join(folder, "config.json")) as handle:
+                config = json.load(handle)
+            with open(os.path.join(folder, "diffusion_pytorch_model.safetensors.index.json")) as handle:
+                index = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(config, Mapping) or not isinstance(index, Mapping):
+            continue
+        control = config.get("control_config")
+        weights = index.get("weight_map")
+        if (
+            config.get("_class_name") == "H3Transformer"
+            and isinstance(control, Mapping)
+            and control.get("enable") is True
+            and control.get("dim_in") == 6
+            and isinstance(weights, Mapping)
+            and "control.block_injectors.0.scale.weight" in weights
+        ):
+            return True
+    return False
 
 
 def _looks_like_dreamzero(model_name: str) -> bool:

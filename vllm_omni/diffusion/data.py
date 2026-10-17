@@ -1627,6 +1627,24 @@ class OmniDiffusionConfig:
 
         assert self.model is not None
 
+        # JING has no root pipeline index. Its component config also carries
+        # a generic H3 class name when the transformer subfolder is used directly.
+        if resolve_native_diffusion_model_class(self.model) == "XGenJingPipeline":
+            if self.diffusion_load_format == "diffusers":
+                raise ValueError("XGEN-JING requires the native diffusion load format, not the Diffusers adapter.")
+            self.model_class_name = "XGenJingPipeline"
+            config_file = (
+                "config.json"
+                if os.path.isfile(os.path.join(self.model, "config.json"))
+                else "jing_flash_v1/config.json"
+            )
+            jing_config = get_hf_file_to_dict(config_file, self.model, revision=self.revision)
+            if not isinstance(jing_config, Mapping) or jing_config.get("_class_name") != "H3Transformer":
+                raise ValueError(f"Could not load the XGEN-JING transformer configuration from {self.model}")
+            self.set_tf_model_config(TransformerConfig.from_dict(dict(jing_config)))
+            self.update_multimodal_support()
+            return
+
         native_single_file_model = resolve_native_single_file(self.model_class_name)
         if self.is_single_file and native_single_file_model is not None:
             self.diffusion_load_format = "default"
