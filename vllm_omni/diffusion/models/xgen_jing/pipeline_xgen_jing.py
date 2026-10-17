@@ -13,9 +13,18 @@ import PIL.Image
 import torch
 from torch import nn
 from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
+from vllm.distributed.parallel_state import get_tp_group
 
 from vllm_omni.diffusion.cancellation import check_request_cancellation
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.parallel_state import (
+    get_cfg_group,
+    get_dp_group,
+    get_pp_group,
+    get_sp_group,
+    get_world_group,
+    model_parallel_is_initialized,
+)
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -195,6 +204,19 @@ class XGenJingPipeline(
         self.parallel_config = od_config.parallel_config
         self._request_cache_enabled = request_cache_enabled(od_config.model_config)
         self._last_request_cache_stats: dict[str, int | bool] | None = None
+        self._output_rank_only_d2h = od_config.model_config.get("xgen_jing_output_rank_only_d2h", False)
+        if type(self._output_rank_only_d2h) is not bool:
+            raise TypeError("model_config.xgen_jing_output_rank_only_d2h must be a boolean")
+        if self._output_rank_only_d2h:
+            if (
+                self.parallel_config.data_parallel_size not in (None, 1)
+                or self.parallel_config.pipeline_parallel_size != 1
+                or self.parallel_config.cfg_parallel_size != 1
+                or self.parallel_config.use_hsdp
+            ):
+                raise ValueError("XGEN-JING output-rank D2H requires DP=PP=CFG=1 and HSDP disabled")
+            self._is_output_rank()  # Validate the actual runtime groups before loading weights.
+        self.output_d2h_stats: dict[str, bool | int] = {}
         self._vae_cpu_offload = od_config.model_config.get("xgen_jing_vae_cpu_offload", False)
         if type(self._vae_cpu_offload) is not bool:
             raise TypeError("model_config.xgen_jing_vae_cpu_offload must be a boolean")
@@ -564,12 +586,81 @@ class XGenJingPipeline(
         quantized.copy_(frames)
         return quantized, audio
 
+    def _is_output_rank(self) -> bool:
+        """Match the executor's primary TP/SP/CFG/PP coordinates for one replica."""
+        if not model_parallel_is_initialized():
+            if self.parallel_config.world_size == 1 and not torch.distributed.is_initialized():
+                return True
+            raise RuntimeError("XGEN-JING output-rank D2H requires initialized model-parallel groups")
+        tp_size = self.parallel_config.tensor_parallel_size
+        sp_size = self.parallel_config.sequence_parallel_size or 1
+        groups = {
+            "tp": (get_tp_group(), tp_size),
+            "sp": (get_sp_group(), sp_size),
+            "pp": (get_pp_group(), 1),
+            "cfg": (get_cfg_group(), 1),
+            "dp": (get_dp_group(), 1),
+        }
+        for name, (group, expected_size) in groups.items():
+            if group.world_size != expected_size:
+                raise RuntimeError(
+                    f"XGEN-JING output-rank D2H requires {name} size {expected_size}, got {group.world_size}"
+                )
+        expected_world = tp_size * sp_size
+        if get_world_group().world_size != expected_world:
+            raise RuntimeError("XGEN-JING output-rank D2H requires a single TP/SP replica")
+        # DiffusionWorker's RPC reply gate uses these coordinates, not a
+        # process-local CUDA ordinal or a hard-coded global rank.
+        return all(group.rank_in_group == 0 for group, _ in groups.values())
+
+    def _copy_output_on_owner(
+        self, video: torch.Tensor | None, audio: torch.Tensor | None, *, is_owner: bool
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        output = None
+        error = None
+        try:
+            if is_owner:
+                if video is None or audio is None:
+                    raise RuntimeError("XGEN-JING output owner did not receive decoded media")
+                output = video.cpu(), audio.cpu()
+                self.output_d2h_stats["video_bytes"] += (
+                    video.numel() * video.element_size() if video.device.type != "cpu" else 0
+                )
+                self.output_d2h_stats["audio_bytes"] += (
+                    audio.numel() * audio.element_size() if audio.device.type != "cpu" else 0
+                )
+                self.output_d2h_stats["outputs_transferred"] += 1
+        except Exception as exc:  # noqa: BLE001 - Relay the owner failure before the next collective.
+            # Peers must not enter the next output's collectives when the owner
+            # failed to allocate/copy its CPU media. Propagate the same failure.
+            error = f"{type(exc).__name__}: {exc}"
+            output = None
+        errors = [error]
+        if model_parallel_is_initialized():
+            group = get_world_group()
+            if group.world_size > 1:
+                errors = [None] * group.world_size
+                torch.distributed.all_gather_object(errors, error, group=group.cpu_group)
+        failures = [message for message in errors if message is not None]
+        if failures:
+            raise RuntimeError(f"XGEN-JING output CPU transfer failed: {failures}")
+        return output
+
     @torch.no_grad()
     def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
         if len(request.prompts) != 1:
             raise OmniClientError("XGEN-JING supports one request at a time")
         check_request_cancellation(synchronize=True)
         params = request.sampling_params
+        is_output_rank = self._is_output_rank() if self._output_rank_only_d2h else True
+        if self._output_rank_only_d2h:
+            self.output_d2h_stats = {
+                "enabled": True,
+                "is_output_rank": is_output_rank,
+                "video_bytes": 0,
+                "audio_bytes": 0,
+                "outputs_transferred": 0,
+            }
         case = self._prepare_request(request.prompts[0], params)
         conditioning = self.encode_conditioning(case)
         videos, audios = [], []
@@ -578,9 +669,25 @@ class XGenJingPipeline(
             packed = self._initial_inputs(conditioning, case["seed"] + output_index)
             video_latents, audio_latents = self.diffuse(packed)
             video, audio = self.decode(video_latents, audio_latents, case)
-            videos.append(video.cpu())
-            audios.append(audio.cpu())
+            if self._output_rank_only_d2h:
+                # All ranks finish decode and vote on cancellation before any
+                # output-owner branch. Keep every output iteration in lockstep.
+                check_request_cancellation(synchronize=True)
+                cpu_output = self._copy_output_on_owner(video, audio, is_owner=is_output_rank)
+                if cpu_output is not None:
+                    videos.append(cpu_output[0])
+                    audios.append(cpu_output[1])
+                del cpu_output
+            else:
+                videos.append(video.cpu())
+                audios.append(audio.cpu())
             del packed, video_latents, audio_latents, video, audio
+        if self._output_rank_only_d2h and not is_output_rank:
+            # The runner accepts an empty DiffusionOutput and the executor only
+            # transports the primary rank's result. No postprocessor sees None.
+            return DiffusionOutput(
+                stage_durations=self.stage_durations if self.enable_diffusion_pipeline_profiler else {},
+            )
         return DiffusionOutput(
             output=(torch.cat(videos), torch.cat(audios)),
             video_output_index=0,
